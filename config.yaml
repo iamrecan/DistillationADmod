@@ -1,12 +1,18 @@
-data_path: "../../datasets/MVTEC"
-distillType: sn 
-obj: wood
+#data_path: "../../datasets/archive/wood"
+data_path: "..\\datasets\\archive\\pill"  # Point to the root wood folder
+distillType: sn
+obj: Pill
 phase: train
 save_path: "./results"
 TrainingData:
-  epochs: 50
-  batch_size: 8
+  epochs: 20
+  batch_size: 64
   lr: 0.0004
   img_size: 224
   crop_size: 224
   norm: True # normalize features before loss calculation
+
+# EfficientAD specific settings
+#EfficientAD:
+#  pdn_model: "small"  # Choices: ["small", "medium"]
+#  student_type: "efficientnet_b4"  # Optional: specify student model type

@@ -10,7 +10,8 @@ RESNET_LAYERS = {
     "resnet152": [3, 8, 36, 3],
     "wide_resnet50_2": [3, 4, 6, 3],
     "wide_resnet101_2": [3, 4, 23, 3]
-    }
+}
+
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
     """3x3 convolution with padding"""
@@ -22,6 +23,7 @@ def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
     """1x1 convolution"""
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
+
 def deconv2x2(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
     """1x1 convolution"""
     return nn.ConvTranspose2d(in_planes, out_planes, kernel_size=2, stride=stride,
@@ -32,15 +34,15 @@ class BasicBlock(nn.Module):
     expansion: int = 1
 
     def __init__(
-        self,
-        inplanes: int,
-        planes: int,
-        stride: int = 1,
-        downsample: Optional[nn.Module] = None,
-        groups: int = 1,
-        base_width: int = 64,
-        dilation: int = 1,
-        norm_layer: Optional[Callable[..., nn.Module]] = None
+            self,
+            inplanes: int,
+            planes: int,
+            stride: int = 1,
+            downsample: Optional[nn.Module] = None,
+            groups: int = 1,
+            base_width: int = 64,
+            dilation: int = 1,
+            norm_layer: Optional[Callable[..., nn.Module]] = None
     ) -> None:
         super(BasicBlock, self).__init__()
         if norm_layer is None:
@@ -74,19 +76,18 @@ class BasicBlock(nn.Module):
 
 
 class Bottleneck(nn.Module):
-
     expansion: int = 4
 
     def __init__(
-        self,
-        inplanes: int,
-        planes: int,
-        stride: int = 1,
-        downsample: Optional[nn.Module] = None,
-        groups: int = 1,
-        base_width: int = 64,
-        dilation: int = 1,
-        norm_layer: Optional[Callable[..., nn.Module]] = None
+            self,
+            inplanes: int,
+            planes: int,
+            stride: int = 1,
+            downsample: Optional[nn.Module] = None,
+            groups: int = 1,
+            base_width: int = 64,
+            dilation: int = 1,
+            norm_layer: Optional[Callable[..., nn.Module]] = None
     ) -> None:
         super(Bottleneck, self).__init__()
         if norm_layer is None:
@@ -125,20 +126,19 @@ class Bottleneck(nn.Module):
         return out
 
 
-
 class deBasicBlock(nn.Module):
     expansion: int = 1
 
     def __init__(
-        self,
-        inplanes: int,
-        planes: int,
-        stride: int = 1,
-        upsample: Optional[nn.Module] = None,
-        groups: int = 1,
-        base_width: int = 64,
-        dilation: int = 1,
-        norm_layer: Optional[Callable[..., nn.Module]] = None
+            self,
+            inplanes: int,
+            planes: int,
+            stride: int = 1,
+            upsample: Optional[nn.Module] = None,
+            groups: int = 1,
+            base_width: int = 64,
+            dilation: int = 1,
+            norm_layer: Optional[Callable[..., nn.Module]] = None
     ) -> None:
         super(deBasicBlock, self).__init__()
         if norm_layer is None:
@@ -178,19 +178,18 @@ class deBasicBlock(nn.Module):
 
 
 class deBottleneck(nn.Module):
-
     expansion: int = 4
 
     def __init__(
-        self,
-        inplanes: int,
-        planes: int,
-        stride: int = 1,
-        upsample: Optional[nn.Module] = None,
-        groups: int = 1,
-        base_width: int = 64,
-        dilation: int = 1,
-        norm_layer: Optional[Callable[..., nn.Module]] = None
+            self,
+            inplanes: int,
+            planes: int,
+            stride: int = 1,
+            upsample: Optional[nn.Module] = None,
+            groups: int = 1,
+            base_width: int = 64,
+            dilation: int = 1,
+            norm_layer: Optional[Callable[..., nn.Module]] = None
     ) -> None:
         super(deBottleneck, self).__init__()
         if norm_layer is None:
@@ -236,16 +235,16 @@ class AttnBasicBlock(nn.Module):
     expansion: int = 1
 
     def __init__(
-        self,
-        inplanes: int,
-        planes: int,
-        stride: int = 1,
-        downsample: Optional[nn.Module] = None,
-        groups: int = 1,
-        base_width: int = 64,
-        dilation: int = 1,
-        norm_layer: Optional[Callable[..., nn.Module]] = None,
-        attention: bool = True,
+            self,
+            inplanes: int,
+            planes: int,
+            stride: int = 1,
+            downsample: Optional[nn.Module] = None,
+            groups: int = 1,
+            base_width: int = 64,
+            dilation: int = 1,
+            norm_layer: Optional[Callable[..., nn.Module]] = None,
+            attention: bool = True,
     ) -> None:
         super(AttnBasicBlock, self).__init__()
         self.attention = attention
@@ -273,7 +272,6 @@ class AttnBasicBlock(nn.Module):
         out = self.conv2(out)
         out = self.bn2(out)
 
-
         if self.downsample is not None:
             identity = self.downsample(x)
 
@@ -282,21 +280,21 @@ class AttnBasicBlock(nn.Module):
 
         return out
 
+
 class AttnBottleneck(nn.Module):
-    
     expansion: int = 4
 
     def __init__(
-        self,
-        inplanes: int,
-        planes: int,
-        stride: int = 1,
-        downsample: Optional[nn.Module] = None,
-        groups: int = 1,
-        base_width: int = 64,
-        dilation: int = 1,
-        norm_layer: Optional[Callable[..., nn.Module]] = None,
-        attention: bool = True,
+            self,
+            inplanes: int,
+            planes: int,
+            stride: int = 1,
+            downsample: Optional[nn.Module] = None,
+            groups: int = 1,
+            base_width: int = 64,
+            dilation: int = 1,
+            norm_layer: Optional[Callable[..., nn.Module]] = None,
+            attention: bool = True,
     ) -> None:
         super(AttnBottleneck, self).__init__()
         self.attention = attention
@@ -330,12 +328,12 @@ class AttnBottleneck(nn.Module):
         if self.downsample is not None:
             identity = self.downsample(x)
 
-
         out += identity
         out = self.relu(out)
 
         return out
-    
+
+
 def init_weights(instance):
     for m in instance.modules():
         if isinstance(m, nn.Conv2d):
