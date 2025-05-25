@@ -12,6 +12,9 @@ from models.ReverseDistillation.trainer_rd import RdTrainer
 from models.StudentTeacher.trainer_st import StTrainer
 import matplotlib.pyplot as plt
 import json
+import cv2
+from PIL import Image
+import torchvision.transforms as transforms
 
 
 def load_model(model_type, config, device):
@@ -150,6 +153,51 @@ def save_and_plot_results(results, save_dir):
     plt.close()
 
 
+def preprocess_image(image_path, img_size=224):
+    """Preprocess image for inference"""
+    transform = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                           std=[0.229, 0.224, 0.225])
+    ])
+    
+    image = Image.open(image_path).convert('RGB')
+    image_tensor = transform(image).unsqueeze(0)
+    return image_tensor
+
+
+def visualize_results(original_image, anomaly_map, threshold, save_path=None):
+    """Visualize original image, anomaly map and thresholded result"""
+    plt.figure(figsize=(15, 5))
+    
+    # Original image
+    plt.subplot(131)
+    plt.imshow(original_image)
+    plt.title('Original Image')
+    plt.axis('off')
+    
+    # Anomaly map
+    plt.subplot(132)
+    plt.imshow(anomaly_map, cmap='jet')
+    plt.colorbar()
+    plt.title('Anomaly Map')
+    plt.axis('off')
+    
+    # Thresholded result
+    plt.subplot(133)
+    thresholded = (anomaly_map > threshold).astype(np.float32)
+    plt.imshow(thresholded, cmap='gray')
+    plt.title(f'Thresholded (>{threshold:.3f})')
+    plt.axis('off')
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+        print(f"Results saved to {save_path}")
+    plt.show()
+
+
 def main():
     # CUDA availability check and info
     print("\nCUDA Information:")
@@ -274,6 +322,72 @@ def main():
     save_and_plot_results(results, save_dir)
     print(f"\nResults saved to {save_dir}")
 
+    # Configuration
+    model_type = "sn"  # or "dbfad", "ead", "rd", "st"
+    threshold = 0.291  # default threshold, can be changed
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Base configuration
+    config = {
+        "data_path": "./dataset/wood",  # change as needed
+        "obj": "wood",  # change as needed
+        "save_path": "./results",
+        "distillType": model_type,
+        "TrainingData": {
+            "img_size": 224,
+            "crop_size": 224,
+            "norm": True
+        }
+    }
+    
+    # Load model
+    print(f"Loading {model_type.upper()} model on {device}")
+    trainer = load_model(model_type, config, device)
+    model_path = Path(f"results/models/{config['obj']}/{model_type}/best.pth")
+    
+    if not model_path.exists():
+        print(f"No weights found at {model_path}")
+        return
+    
+    trainer.load_weights()
+    
+    # Get input image path from user
+    image_path = input("Enter the path to the image: ")
+    if not Path(image_path).exists():
+        print(f"Image not found at {image_path}")
+        return
+    
+    # Process image
+    image_tensor = preprocess_image(image_path)
+    image_tensor = image_tensor.to(device)
+    
+    # Run inference
+    print("Running inference...")
+    with torch.no_grad():
+        trainer.infer(image_tensor)
+        anomaly_map = trainer.post_process()
+    
+    # Get anomaly map
+    anomaly_map = anomaly_map[0].cpu().numpy()
+    
+    # Allow user to adjust threshold
+    while True:
+        # Load original image for visualization
+        original_image = cv2.imread(image_path)
+        original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+        
+        # Visualize results
+        save_path = f"results/inference_results_{Path(image_path).stem}.png"
+        visualize_results(original_image, anomaly_map, threshold, save_path)
+        
+        # Ask if user wants to adjust threshold
+        new_threshold = input(f"Current threshold: {threshold}. Enter new threshold (or 'q' to quit): ")
+        if new_threshold.lower() == 'q':
+            break
+        try:
+            threshold = float(new_threshold)
+        except ValueError:
+            print("Invalid threshold value. Please enter a number.")
 
 if __name__ == "__main__":
     main()

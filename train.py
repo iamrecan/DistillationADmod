@@ -1,5 +1,5 @@
-
 import torch
+import sys
 from utils.util import readYamlConfig
 from models.DBFAD.trainer_dbfad import DbfadTrainer
 from models.EfficientAD.trainer_ead import EadTrainer
@@ -13,7 +13,14 @@ from models.SingleNet.trainer_sn import SnTrainer
 if __name__ == "__main__":
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        data =readYamlConfig("config.yaml")
+        
+        # Get config file path from command line argument or use default
+        config_file = "configs/configSN.yaml"
+        if len(sys.argv) > 1:
+            config_file = sys.argv[1]
+            
+        data = readYamlConfig(config_file)
+        print(f"Loading config from: {config_file}")
         print(f"Loading data from: {data['data_path']}")
 
         distillType = data['distillType']

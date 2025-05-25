@@ -111,11 +111,32 @@ def computeAUROC(scores, gt_list, obj, name="base"):
 
 
 def loadWeights(model, model_dir, alias):
+    file_path = os.path.join(model_dir, alias)
+    print(f"Attempting to load weights from: {file_path}")  # Debug print
     try:
-        checkpoint = torch.load(os.path.join(model_dir, alias), weights_only=False)
-    except Exception:
-        raise Exception("Check saved model path.")
-    model.load_state_dict(checkpoint["model"])
+        checkpoint = torch.load(file_path, weights_only=False)  # map_location can be added if needed
+    except FileNotFoundError:
+        print(f"Error: Model file not found at '{file_path}'. Please check the path.")
+        raise  # Re-raise FileNotFoundError to get the full traceback
+    except RuntimeError as e:
+        print(f"RuntimeError loading weights from '{file_path}': {e}")
+        print("This could be due to a mismatch in model architecture or a corrupted file.")
+        raise  # Re-raise RuntimeError
+    except Exception as e:
+        print(f"An unexpected error occurred while loading weights from '{file_path}': {e}")
+        # Re-raise the original exception to get the full traceback
+        raise e
+
+    try:
+        model.load_state_dict(checkpoint["model"])
+    except KeyError:
+        print(f"Error: 'model' key not found in the checkpoint loaded from '{file_path}'.")
+        print(f"Available keys: {checkpoint.keys() if isinstance(checkpoint, dict) else 'Checkpoint is not a dict'}")
+        raise
+    except Exception as e:
+        print(f"Error loading state_dict into model: {e}")
+        raise
+
     model.eval()
     for param in model.parameters():
         param.requires_grad = False

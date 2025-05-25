@@ -1,0 +1,1 @@
+source /Users/emreozturk/PycharmProjects/pythonProject/SAI/venv/bin/activate 

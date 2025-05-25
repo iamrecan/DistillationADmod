@@ -20,13 +20,33 @@ class BaseTrainer:
         # You can set seed for reproducibility
         set_seed(42)
 
-        self.load_model()
-        self.load_data()
-        self.load_optim()
+        self.load_model() # Essential for creating model structure
 
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=self.lr * 10,
-                                                             epochs=self.num_epochs,
-                                                             steps_per_epoch=len(self.train_loader))
+        # Check if we are in a mode that doesn't require full data/optimizer setup
+        is_inference_only_mode = data.get('inference_only_mode', False)
+
+        if not is_inference_only_mode:
+            self.load_data()
+            self.load_optim() 
+            # Ensure optimizer and train_loader are initialized before creating scheduler
+            if hasattr(self, 'optimizer') and self.optimizer is not None and \
+               hasattr(self, 'train_loader') and self.train_loader is not None and \
+               hasattr(self, 'num_epochs') and self.num_epochs is not None and \
+               hasattr(self, 'lr') and self.lr is not None:
+                self.scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=self.lr * 10,
+                                                                     epochs=self.num_epochs,
+                                                                     steps_per_epoch=len(self.train_loader))
+            else:
+                self.scheduler = None
+                print("BaseTrainer: Optimizer, train_loader, num_epochs, or lr not fully available, skipping scheduler setup.")
+        else:
+            self.train_loader = None
+            self.val_loader = None
+            self.optimizer = None # Explicitly set to None in inference only mode
+            self.scheduler = None
+            print("BaseTrainer: 'inference_only_mode' is True. Skipping data loading, optimizer, and scheduler setup.")
+            # SnTrainer.load_optim() will be called by SnTrainer.__init__ if it's not overridden or handled.
+            # If SnTrainer.load_optim() only creates an optimizer, it's fine for it to be overwritten by self.optimizer = None here.
 
     def load_optim(self):
         pass
@@ -83,7 +103,7 @@ class BaseTrainer:
 
     def load_data(self):
         kwargs = ({"num_workers": 8, "pin_memory": True} if torch.cuda.is_available() else {})
-        train_dir = os.path.join(self.data_path, "train", "good")
+        train_dir = os.path.join(self.data_path, "train", "good") if not self.obj else os.path.join(self.data_path, self.obj, "train", "good")
 
         # Debug information
         print(f"\nDetailed dataset debugging:")
@@ -275,37 +295,72 @@ class BaseTrainer:
         return img_roc_auc
 
     def _compute_and_save_metrics(self, scores, gt_list, vis_dir):
-        """Compute metrics and save ROC curve"""
-        # Calculate ROC-AUC using existing function
+        """Compute metrics and save ROC curve with optimal threshold"""
+        from sklearn.metrics import roc_curve, f1_score, precision_recall_curve
+        import numpy as np
+
+        # Calculate ROC-AUC
         img_roc_auc, img_scores = computeAUROC(scores, gt_list, self.obj, " " + self.distillType)
 
-        # Calculate threshold using Otsu's method
-        from skimage.filters import threshold_otsu
-        threshold = threshold_otsu(img_scores)
+        # Calculate ROC and PR curves
+        fpr, tpr, thresholds_roc = roc_curve(gt_list, img_scores)
+        precisions, recalls, thresholds_pr = precision_recall_curve(gt_list, img_scores)
 
-        # Calculate ROC curve data manually
-        from sklearn.metrics import roc_curve
-        fpr, tpr, _ = roc_curve(gt_list, img_scores)
+        # Find optimal threshold that maximizes F1 score
+        f1_scores = []
+        for threshold in thresholds_pr:
+            predictions = (img_scores > threshold).astype(int)
+            f1 = f1_score(gt_list, predictions)
+            f1_scores.append(f1)
 
-        # plot roc curve here
-        plt.figure(figsize=(10, 10))
-        # Plot ROC curve
-        plt.figure(figsize=(10, 10))
-        plt.plot(fpr, tpr, label=f'ROC curve (AUC = {img_roc_auc:.3f})')
-        plt.plot([0, 1], [0, 1], 'k--')  # diagonal line
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title('Receiver Operating Characteristic (ROC)')
-        plt.legend(loc="lower right")
-        plt.savefig(vis_dir / 'roc_curve.png')
+        optimal_idx = np.argmax(f1_scores)
+        optimal_threshold = thresholds_pr[optimal_idx]
+        best_f1 = f1_scores[optimal_idx]
+
+        # Plot ROC and PR curves
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # ROC curve
+        ax1.plot(fpr, tpr, label=f'ROC curve (AUC = {img_roc_auc:.3f})')
+        ax1.plot([0, 1], [0, 1], 'k--')
+        ax1.set_xlim([0.0, 1.0])
+        ax1.set_ylim([0.0, 1.05])
+        ax1.set_xlabel('False Positive Rate')
+        ax1.set_ylabel('True Positive Rate')
+        ax1.set_title('Receiver Operating Characteristic (ROC)')
+        ax1.legend(loc="lower right")
+
+        # Precision-Recall curve
+        ax2.plot(recalls, precisions, label=f'PR curve (F1 = {best_f1:.3f})')
+        ax2.set_xlabel('Recall')
+        ax2.set_ylabel('Precision')
+        ax2.set_title('Precision-Recall Curve')
+        ax2.legend(loc="lower left")
+
+        plt.tight_layout()
+        plt.savefig(vis_dir / 'metrics_curves.png')
         plt.close()
 
-        print(f"\nResults saved to: {vis_dir}")
-        print(f"ROC-AUC Score: {img_roc_auc:.3f}")
+        # Save detailed metrics
+        predictions = (img_scores > optimal_threshold).astype(int)
+        tp = np.sum((predictions == 1) & (gt_list == 1))
+        fp = np.sum((predictions == 1) & (gt_list == 0))
+        fn = np.sum((predictions == 0) & (gt_list == 1))
+        tn = np.sum((predictions == 0) & (gt_list == 0))
 
-        return img_roc_auc, threshold
+        with open(vis_dir / 'metrics_report.txt', 'w') as f:
+            f.write(f"Detailed Metrics Report\n")
+            f.write(f"=====================\n")
+            f.write(f"ROC-AUC Score: {img_roc_auc:.3f}\n")
+            f.write(f"Optimal F1-Score: {best_f1:.3f}\n")
+            f.write(f"Optimal Threshold: {optimal_threshold:.3f}\n\n")
+            f.write(f"Confusion Matrix:\n")
+            f.write(f"True Positives: {tp}\n")
+            f.write(f"False Positives: {fp}\n")
+            f.write(f"False Negatives: {fn}\n")
+            f.write(f"True Negatives: {tn}\n")
+
+        return img_roc_auc, optimal_threshold
 
     def _save_test_visualization(self, image, score, img_path, gt_label, predicted_score, threshold, vis_dir):
         """

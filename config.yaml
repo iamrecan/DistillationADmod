@@ -1,16 +1,17 @@
 #data_path: "../../datasets/archive/wood"
-data_path: "..\\datasets\\archive\\pill"  # Point to the root wood folder
-distillType: sn
-obj: Pill
-phase: train
-save_path: "./results"
+data_path: "dataset"  # Base dataset directory
+distillType: "sn"  # SingleNet
+obj: "wood"  # Dataset name
+phase: "train"  # Training phase
+save_path: "results"  # Output directory
+
 TrainingData:
-  epochs: 20
-  batch_size: 64
+  epochs: 100
+  batch_size: 32
   lr: 0.0004
   img_size: 224
   crop_size: 224
-  norm: True # normalize features before loss calculation
+  norm: true
 
 # EfficientAD specific settings
 #EfficientAD:

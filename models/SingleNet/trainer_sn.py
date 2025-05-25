@@ -18,6 +18,7 @@ class SnTrainer(BaseTrainer):
     def load_model(self):
         self.teacher = teacherTimm(backbone_name="resnet18", out_indices=[2]).to(self.device)
         self.student = singleNet().to(self.device)
+        self.model = self.student  # Add this line to make self.model available for the interactive script
 
     def change_mode(self, period="train"):
         if period == "train":
