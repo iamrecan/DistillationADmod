@@ -37,9 +37,21 @@ class IntegratedAnomalySystem:
         self.supported_models = ["sn", "dbfad", "ead", "rd", "st"]
         self.threshold = 0.291  # Varsayılan threshold
         
+        # 🧠 Adaptif threshold parametreleri (normalized anomaly score için)
+        self.adaptive_threshold_config = {
+            "use_adaptive": True,
+            "methods": ["percentile", "statistical", "iqr"],
+            "percentile_threshold": 95,  # 95th percentile
+            "std_multiplier": 2.5,      # mean + 2.5*std
+            "iqr_multiplier": 1.5,      # Q3 + 1.5*IQR
+            "min_anomaly_ratio": 0.001, # Minimum %0.1 anomali oranı
+            "combine_method": "mean"     # Methods: "mean", "max", "min"
+        }
+        
         print(f"🔧 Sistem başlatıldı - Cihaz: {self.device}")
         if self.device.type == "cuda":
             print(f"   GPU: {torch.cuda.get_device_name(0)}")
+        print(f"🧠 Adaptif threshold sistemi: {'✅ Aktif' if self.adaptive_threshold_config['use_adaptive'] else '❌ Pasif'}")
     
     def load_anomaly_model(self, model_type: str, config: Dict) -> object:
         """Anomali tespit modelini yükle"""
@@ -91,9 +103,9 @@ class IntegratedAnomalySystem:
         return available_models
     
     def detect_anomalies(self, image_path: str, model_type: str, dataset: str) -> Dict:
-        """1️⃣ ADIM: Anomali tespiti yap"""
+        """1️⃣ ADIM: Anomali tespiti yap - Normalized Anomaly Score ile"""
         print("\n" + "="*60)
-        print("🔍 ADIM 1: ANOMALİ TESPİTİ")
+        print("🔍 ADIM 1: ANOMALİ TESPİTİ (Normalized Anomaly Score)")
         print("="*60)
         
         try:
@@ -157,38 +169,97 @@ class IntegratedAnomalySystem:
             if len(anomaly_map.shape) == 3:
                 anomaly_map = anomaly_map[0]  # Remove batch dimension
             
-            # Anomali skorunu hesapla
+            # 📊 Temel anomali skorlarını hesapla
             max_anomaly = np.max(anomaly_map)
             mean_anomaly = np.mean(anomaly_map)
-            anomaly_pixels = np.sum(anomaly_map > self.threshold)
+            std_anomaly = np.std(anomaly_map)
+            
+            print(f"📊 Temel Anomali İstatistikleri:")
+            print(f"   📏 Min/Max: [{np.min(anomaly_map):.6f}, {max_anomaly:.6f}]")
+            print(f"   📈 Mean ± Std: {mean_anomaly:.6f} ± {std_anomaly:.6f}")
+            print(f"   📊 Orijinal Threshold: {self.threshold:.6f}")
+            
+            # 🧠 Adaptif threshold hesapla (eğer aktifse)
+            adaptive_results = {}
+            final_threshold = self.threshold
+            threshold_method = "Orijinal (Sabit)"
+            
+            if self.adaptive_threshold_config["use_adaptive"]:
+                adaptive_results = self.calculate_adaptive_threshold(anomaly_map)
+                
+                # Adaptif threshold daha iyi mi kontrol et
+                if adaptive_results["is_adaptive_better"]:
+                    final_threshold = adaptive_results["adaptive_threshold"]
+                    threshold_method = "Adaptif (Normalized)"
+                    print(f"🧠 Adaptif threshold kullanılacak: {final_threshold:.6f}")
+                else:
+                    print(f"⚠️  Adaptif threshold kaliteli değil, orijinal threshold kullanılıyor: {self.threshold:.6f}")
+            
+            # Final anomali hesaplamaları
+            anomaly_pixels = np.sum(anomaly_map > final_threshold)
             total_pixels = anomaly_map.size
             anomaly_ratio = anomaly_pixels / total_pixels
             
-            print(f"📊 Anomali İstatistikleri:")
-            print(f"   Maksimum skor: {max_anomaly:.4f}")
-            print(f"   Ortalama skor: {mean_anomaly:.4f}")
-            print(f"   Threshold: {self.threshold}")
-            print(f"   Anomali pikselleri: {anomaly_pixels}/{total_pixels} ({anomaly_ratio:.2%})")
+            print(f"\n🎯 Final Anomali Analizi ({threshold_method}):")
+            print(f"   🔴 Threshold: {final_threshold:.6f}")
+            print(f"   📊 Anomali pikselleri: {anomaly_pixels:,}/{total_pixels:,} ({anomaly_ratio:.4%})")
             
-            # Anomali var mı?
-            has_anomaly = max_anomaly > self.threshold and anomaly_ratio > 0.001
+            # 🔍 Normalized Anomaly Score hesapla
+            normalized_scores = None
+            if adaptive_results and "normalized_scores" in adaptive_results:
+                normalized_scores = adaptive_results["normalized_scores"]
+                normalized_threshold = adaptive_results["normalized_threshold"]
+                
+                # Normalized skorlarda anomali oranı
+                normalized_anomaly_count = np.sum(normalized_scores > normalized_threshold)
+                normalized_anomaly_ratio = normalized_anomaly_count / len(normalized_scores)
+                
+                print(f"🧠 Normalized Anomaly Score Analizi:")
+                print(f"   📈 Z-score threshold: {normalized_threshold:.3f}")
+                print(f"   🔴 Normalized anomali oranı: {normalized_anomaly_ratio:.4%}")
+            
+            # Anomali var mı? (Daha hassas kriter)
+            has_anomaly = (
+                max_anomaly > final_threshold and 
+                anomaly_ratio > self.adaptive_threshold_config["min_anomaly_ratio"]
+            )
+            
+            # Anomali seviyesi belirleme
+            if anomaly_ratio < 0.001:
+                severity = "NORMAL"
+                severity_emoji = "✅"
+            elif anomaly_ratio < 0.01:
+                severity = "DÜŞÜK RİSK"
+                severity_emoji = "⚠️"
+            elif anomaly_ratio < 0.05:
+                severity = "ORTA RİSK"
+                severity_emoji = "🟠"
+            else:
+                severity = "YÜKSEK RİSK"
+                severity_emoji = "🚨"
             
             result = {
                 "success": True,
                 "has_anomaly": has_anomaly,
                 "max_score": float(max_anomaly),
                 "mean_score": float(mean_anomaly),
-                "threshold": self.threshold,
+                "std_score": float(std_anomaly),
+                "threshold": final_threshold,
+                "threshold_method": threshold_method,
                 "anomaly_ratio": float(anomaly_ratio),
                 "anomaly_map": anomaly_map,
                 "model_type": model_type,
-                "dataset": dataset
+                "dataset": dataset,
+                "severity": severity,
+                "severity_emoji": severity_emoji,
+                "adaptive_results": adaptive_results if self.adaptive_threshold_config["use_adaptive"] else None,
+                "normalized_scores": normalized_scores.tolist() if normalized_scores is not None else None
             }
             
             if has_anomaly:
-                print("🔴 ANOMALİ TESPİT EDİLDİ!")
+                print(f"🔴 ANOMALİ TESPİT EDİLDİ! {severity_emoji} {severity}")
             else:
-                print("🟢 Anomali tespit edilmedi")
+                print(f"🟢 Anomali tespit edilmedi - {severity}")
             
             return result
             
@@ -196,6 +267,151 @@ class IntegratedAnomalySystem:
             import traceback
             traceback.print_exc()  # Print full error trace for debugging
             return {"success": False, "error": f"Anomali tespit hatası: {str(e)}"}
+    
+    def calculate_adaptive_threshold(self, anomaly_map: np.ndarray) -> Dict:
+        """🧠 Adaptif threshold hesapla - normalized anomaly score mantığı"""
+        print("\n🧮 Adaptif Threshold Hesaplaması (Normalized Anomaly Score)")
+        print("-" * 60)
+        
+        # Temel istatistikler
+        flat_scores = anomaly_map.flatten()
+        mean_score = np.mean(flat_scores)
+        std_score = np.std(flat_scores)
+        median_score = np.median(flat_scores)
+        
+        # Quartile'lar
+        q1 = np.percentile(flat_scores, 25)
+        q3 = np.percentile(flat_scores, 75)
+        iqr = q3 - q1
+        
+        print(f"📊 Temel İstatistikler:")
+        print(f"   📏 Min/Max: [{np.min(flat_scores):.6f}, {np.max(flat_scores):.6f}]")
+        print(f"   📈 Mean ± Std: {mean_score:.6f} ± {std_score:.6f}")
+        print(f"   📊 Median: {median_score:.6f}")
+        print(f"   📦 Q1/Q3: [{q1:.6f}, {q3:.6f}], IQR: {iqr:.6f}")
+        
+        thresholds = {}
+        
+        # 1. Percentile bazlı threshold
+        percentile_thresh = np.percentile(flat_scores, self.adaptive_threshold_config["percentile_threshold"])
+        thresholds["percentile"] = percentile_thresh
+        
+        # 2. İstatistiksel threshold (mean + k*std)
+        statistical_thresh = mean_score + (self.adaptive_threshold_config["std_multiplier"] * std_score)
+        thresholds["statistical"] = statistical_thresh
+        
+        # 3. IQR bazlı threshold
+        iqr_thresh = q3 + (self.adaptive_threshold_config["iqr_multiplier"] * iqr)
+        thresholds["iqr"] = iqr_thresh
+        
+        # Threshold'ları birleştir
+        selected_methods = self.adaptive_threshold_config["methods"]
+        selected_thresholds = [thresholds[method] for method in selected_methods if method in thresholds]
+        
+        if self.adaptive_threshold_config["combine_method"] == "mean":
+            final_threshold = np.mean(selected_thresholds)
+        elif self.adaptive_threshold_config["combine_method"] == "max":
+            final_threshold = np.max(selected_thresholds)
+        elif self.adaptive_threshold_config["combine_method"] == "min":
+            final_threshold = np.min(selected_thresholds)
+        else:
+            final_threshold = np.mean(selected_thresholds)
+        
+        # Minimum threshold kontrolü (çok düşük olmasın)
+        min_reasonable_threshold = mean_score + 0.5 * std_score
+        final_threshold = max(final_threshold, min_reasonable_threshold)
+        
+        # 🎯 Normalized Anomaly Score hesaplama
+        normalized_scores = (flat_scores - mean_score) / (std_score + 1e-8)  # Z-score normalizasyonu
+        normalized_threshold = (final_threshold - mean_score) / (std_score + 1e-8)
+        
+        # Sonuçları hesapla
+        adaptive_anomaly_pixels = np.sum(flat_scores > final_threshold)
+        adaptive_anomaly_ratio = adaptive_anomaly_pixels / len(flat_scores)
+        
+        # Orijinal threshold ile karşılaştırma
+        original_anomaly_pixels = np.sum(flat_scores > self.threshold)
+        original_anomaly_ratio = original_anomaly_pixels / len(flat_scores)
+        
+        print(f"\n🔬 Threshold Hesaplamaları:")
+        print(f"   📊 Percentile ({self.adaptive_threshold_config['percentile_threshold']}%): {percentile_thresh:.6f}")
+        print(f"   📈 İstatistiksel (μ + {self.adaptive_threshold_config['std_multiplier']}σ): {statistical_thresh:.6f}")
+        print(f"   📦 IQR (Q3 + {self.adaptive_threshold_config['iqr_multiplier']}*IQR): {iqr_thresh:.6f}")
+        print(f"   🎯 Final Adaptif Threshold: {final_threshold:.6f}")
+        print(f"   📏 Orijinal Threshold: {self.threshold:.6f}")
+        print(f"   🧠 Normalized Threshold (Z-score): {normalized_threshold:.3f}")
+        
+        print(f"\n📈 Karşılaştırma:")
+        print(f"   🔴 Adaptif → Anomali oranı: {adaptive_anomaly_ratio:.4%} ({adaptive_anomaly_pixels:,} piksel)")
+        print(f"   🔵 Orijinal → Anomali oranı: {original_anomaly_ratio:.4%} ({original_anomaly_pixels:,} piksel)")
+        
+        # Hangi yöntemin daha mantıklı olduğunu değerlendir
+        is_adaptive_better = self.evaluate_threshold_quality(flat_scores, final_threshold, self.threshold)
+        
+        return {
+            "adaptive_threshold": final_threshold,
+            "original_threshold": self.threshold,
+            "normalized_threshold": normalized_threshold,
+            "normalized_scores": normalized_scores,
+            "method_thresholds": thresholds,
+            "adaptive_anomaly_ratio": adaptive_anomaly_ratio,
+            "original_anomaly_ratio": original_anomaly_ratio,
+            "is_adaptive_better": is_adaptive_better,
+            "statistics": {
+                "mean": mean_score,
+                "std": std_score,
+                "median": median_score,
+                "q1": q1,
+                "q3": q3,
+                "iqr": iqr,
+                "min": np.min(flat_scores),
+                "max": np.max(flat_scores)
+            }
+        }
+    
+    def evaluate_threshold_quality(self, scores: np.ndarray, adaptive_thresh: float, original_thresh: float) -> bool:
+        """🔍 Threshold kalitesini değerlendir - normalized anomaly score kriterlerine göre"""
+        
+        # Adaptif threshold ile tespit edilen anomaliler
+        adaptive_anomalies = scores > adaptive_thresh
+        adaptive_ratio = np.mean(adaptive_anomalies)
+        
+        # Orijinal threshold ile tespit edilen anomaliler
+        original_anomalies = scores > original_thresh
+        original_ratio = np.mean(original_anomalies)
+        
+        # Normalized score kalite kriterleri
+        criteria = {
+            "reasonable_ratio": 0.001 <= adaptive_ratio <= 0.15,  # %0.1 - %15 arası makul
+            "not_too_sensitive": adaptive_ratio < 0.5,  # Çok hassas olmasın
+            "captures_outliers": adaptive_thresh > np.percentile(scores, 90),  # En üst %10'u yakalasın
+            "better_than_original": adaptive_ratio > 0 and abs(adaptive_ratio - original_ratio) > 0.001,
+            "statistical_significance": adaptive_thresh > np.mean(scores) + 2 * np.std(scores)  # İstatistiksel anlamlılık
+        }
+        
+        quality_score = sum(criteria.values())
+        is_better = quality_score >= 3  # 5'ten en az 3'ü sağlanmalı
+        
+        print(f"\n🔍 Threshold Kalite Değerlendirmesi:")
+        for criterion, passed in criteria.items():
+            status = "✅" if passed else "❌"
+            print(f"   {status} {criterion.replace('_', ' ').title()}")
+        print(f"   🎯 Kalite Skoru: {quality_score}/5 - {'🟢 Adaptif Daha İyi' if is_better else '🔵 Orijinal Kullan'}")
+        
+        return is_better
+    
+    def calculate_normalized_anomaly_scores(self, anomaly_map: np.ndarray, threshold: float) -> np.ndarray:
+        """Normalized anomaly scores hesapla (Z-score)"""
+        mean = np.mean(anomaly_map)
+        std = np.std(anomaly_map)
+        
+        # Z-score hesapla
+        z_scores = (anomaly_map - mean) / std
+        
+        # Anomali skoru eşik değerine göre ayarla
+        adjusted_scores = np.where(z_scores > threshold, z_scores, 0)
+        
+        return adjusted_scores
     
     def create_anomaly_points_for_sam2(self, anomaly_map: np.ndarray, image_path: str, 
                                       top_k: int = 5) -> Dict:
@@ -513,64 +729,69 @@ class IntegratedAnomalySystem:
         """Entegre rapor oluştur"""
         print(f"\n📄 Entegre rapor oluşturuluyor: {output_path}")
         
-        # Rapor hazırla
-        report = {
-            "pipeline_info": {
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(results["timestamp"])),
-                "input_image": results["input_image"],
-                "model_type": results["model_type"],
-                "dataset": results["dataset"],
-                "success": results["success"]
-            },
-            "step_results": results.get("steps", {}),
-            "error": results.get("error"),
-            "report_path": output_path
-        }
+        # Rapor hazırla - JSON serializable hale getir
+        def make_serializable(obj):
+            """Objeyi JSON serializable hale getir - geliştirilmiş versiyon"""
+            if obj is None:
+                return None
+            elif isinstance(obj, (str, int, float)):
+                return obj
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+                return float(obj)
+            elif isinstance(obj, (np.bool_, bool, np.bool)):
+                return bool(obj)
+            elif isinstance(obj, dict):
+                return {str(k): make_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple, set)):
+                return [make_serializable(item) for item in obj]
+            elif hasattr(obj, '__dict__'):
+                # Object'i dict'e çevir
+                return make_serializable(obj.__dict__)
+            else:
+                # Son çare: string'e çevir
+                try:
+                    return str(obj)
+                except Exception as e:
+                    print(f"⚠️ Serialization warning for {type(obj)}: {e}")
+                    return f"<{type(obj).__name__}>"
         
-        # Özet bilgiler
-        summary = {
-            "anomaly_detected": False,
-            "segmentation_performed": False,
-            "llm_analysis_completed": False,
-            "final_recommendation": "Analiz tamamlanamadı"
-        }
-        
-        # Adım sonuçlarını analiz et
-        if "anomaly_detection" in results["steps"]:
-            anomaly_step = results["steps"]["anomaly_detection"]
-            if anomaly_step.get("success"):
-                summary["anomaly_detected"] = anomaly_step.get("has_anomaly", False)
-        
-        if "sam2_segmentation" in results["steps"]:
-            sam2_step = results["steps"]["sam2_segmentation"]
-            summary["segmentation_performed"] = sam2_step.get("success", False)
-        
-        if "llm_analysis" in results["steps"]:
-            llm_step = results["steps"]["llm_analysis"]
-            summary["llm_analysis_completed"] = llm_step.get("success", False)
+        try:
+            # Tüm step_results'ı serializable hale getir
+            print("🔧 JSON serialization işlemi başlatılıyor...")
+            serializable_steps = make_serializable(results.get("steps", {}))
             
-            # LLM'den final önerisini al
-            if llm_step.get("success"):
-                analysis = llm_step.get("analysis", {})
-                if "recommended_action" in analysis:
-                    summary["final_recommendation"] = analysis["recommended_action"]
-                elif "cozum_onerisi" in analysis:
-                    summary["final_recommendation"] = analysis["cozum_onerisi"]
+            report = {
+                "pipeline_info": {
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(results["timestamp"])),
+                    "input_image": str(results["input_image"]),
+                    "model_type": str(results["model_type"]),
+                    "dataset": str(results["dataset"]),
+                    "success": bool(results["success"])
+                },
+                "step_results": serializable_steps,
+                "error": str(results.get("error")) if results.get("error") else None,
+                "report_path": str(output_path)
+            }
+            
+            # Raporu kaydet
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
+            
+            print(f"✅ Rapor kaydedildi: {output_path}")
+            
+            # Özet göster
+            print(f"\n📋 PİPELİNE ÖZETİ:")
+            print(f"   🔍 Anomali tespit: {'✅' if summary['anomaly_detected'] else '❌'}")
+            print(f"   🎯 Segmentasyon: {'✅' if summary['segmentation_performed'] else '❌'}")
+            print(f"   🤖 LLM analizi: {'✅' if summary['llm_analysis_completed'] else '❌'}")
+            print(f"   💡 Final öneri: {summary['final_recommendation']}")
         
-        report["summary"] = summary
-        
-        # Raporu kaydet
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-        
-        print(f"✅ Rapor kaydedildi: {output_path}")
-        
-        # Özet göster
-        print(f"\n📋 PİPELİNE ÖZETİ:")
-        print(f"   🔍 Anomali tespit: {'✅' if summary['anomaly_detected'] else '❌'}")
-        print(f"   🎯 Segmentasyon: {'✅' if summary['segmentation_performed'] else '❌'}")
-        print(f"   🤖 LLM analizi: {'✅' if summary['llm_analysis_completed'] else '❌'}")
-        print(f"   💡 Final öneri: {summary['final_recommendation']}")
+        except Exception as e:
+            print(f"❌ Rapor oluşturma hatası: {e}")
 
 
 def main():

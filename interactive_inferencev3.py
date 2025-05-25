@@ -1,4 +1,3 @@
-\
 import torch
 from PIL import Image
 import os
@@ -21,6 +20,119 @@ from utils.functions import cal_anomaly_maps
 # --- Configuration ---
 DEFAULT_IMAGE_SIZE = (224, 224) # Should match the training image size for the model
 INITIAL_THRESHOLD = 0.5
+
+# --- Adaptive Threshold Functions ---
+
+def calculate_adaptive_threshold(anomaly_map, method='combined'):
+    """
+    Calculate adaptive threshold based on anomaly map statistics.
+    
+    Args:
+        anomaly_map: numpy array of anomaly scores
+        method: 'percentile', 'statistical', 'iqr', or 'combined'
+        
+    Returns:
+        float: calculated threshold value
+    """
+    if anomaly_map is None or anomaly_map.size == 0:
+        print("Warning: Empty anomaly map, using default threshold")
+        return INITIAL_THRESHOLD
+    
+    # Clean the data
+    anomaly_map_clean = anomaly_map[np.isfinite(anomaly_map)]
+    if anomaly_map_clean.size == 0:
+        print("Warning: No finite values in anomaly map, using default threshold")
+        return INITIAL_THRESHOLD
+    
+    if method == 'percentile':
+        # Use 95th percentile as threshold
+        threshold = np.percentile(anomaly_map_clean, 95)
+    
+    elif method == 'statistical':
+        # Use mean + 2.5 * std as threshold
+        mean_val = np.mean(anomaly_map_clean)
+        std_val = np.std(anomaly_map_clean)
+        threshold = mean_val + 2.5 * std_val
+    
+    elif method == 'iqr':
+        # Use IQR-based outlier detection
+        q1 = np.percentile(anomaly_map_clean, 25)
+        q3 = np.percentile(anomaly_map_clean, 75)
+        iqr = q3 - q1
+        threshold = q3 + 1.5 * iqr
+    
+    elif method == 'combined':
+        # Combine all methods and take the median
+        percentile_thresh = np.percentile(anomaly_map_clean, 95)
+        
+        mean_val = np.mean(anomaly_map_clean)
+        std_val = np.std(anomaly_map_clean)
+        statistical_thresh = mean_val + 2.5 * std_val
+        
+        q1 = np.percentile(anomaly_map_clean, 25)
+        q3 = np.percentile(anomaly_map_clean, 75)
+        iqr = q3 - q1
+        iqr_thresh = q3 + 1.5 * iqr
+        
+        # Take median of the three methods
+        thresholds = [percentile_thresh, statistical_thresh, iqr_thresh]
+        threshold = np.median(thresholds)
+        
+        print(f"Adaptive threshold calculation:")
+        print(f"  Percentile (95th): {percentile_thresh:.6f}")
+        print(f"  Statistical (μ+2.5σ): {statistical_thresh:.6f}")
+        print(f"  IQR-based (Q3+1.5*IQR): {iqr_thresh:.6f}")
+        print(f"  Combined (median): {threshold:.6f}")
+    
+    else:
+        print(f"Unknown method '{method}', using percentile method")
+        threshold = np.percentile(anomaly_map_clean, 95)
+    
+    # Ensure threshold is within reasonable bounds
+    min_val = np.min(anomaly_map_clean)
+    max_val = np.max(anomaly_map_clean)
+    threshold = np.clip(threshold, min_val, max_val)
+    
+    return float(threshold)
+
+def analyze_anomaly_distribution(anomaly_map):
+    """
+    Analyze the distribution of anomaly scores for better threshold selection.
+    
+    Args:
+        anomaly_map: numpy array of anomaly scores
+        
+    Returns:
+        dict: statistics about the anomaly distribution
+    """
+    if anomaly_map is None or anomaly_map.size == 0:
+        return {}
+    
+    anomaly_map_clean = anomaly_map[np.isfinite(anomaly_map)]
+    if anomaly_map_clean.size == 0:
+        return {}
+    
+    stats = {
+        'min': np.min(anomaly_map_clean),
+        'max': np.max(anomaly_map_clean),
+        'mean': np.mean(anomaly_map_clean),
+        'std': np.std(anomaly_map_clean),
+        'median': np.median(anomaly_map_clean),
+        'q1': np.percentile(anomaly_map_clean, 25),
+        'q3': np.percentile(anomaly_map_clean, 75),
+        'p95': np.percentile(anomaly_map_clean, 95),
+        'p99': np.percentile(anomaly_map_clean, 99)
+    }
+    
+    # Calculate potential anomaly percentage with different thresholds
+    for percentile in [90, 95, 99]:
+        threshold = np.percentile(anomaly_map_clean, percentile)
+        anomaly_count = np.sum(anomaly_map_clean > threshold)
+        total_pixels = anomaly_map_clean.size
+        anomaly_percentage = (anomaly_count / total_pixels) * 100
+        stats[f'anomaly_pct_p{percentile}'] = anomaly_percentage
+    
+    return stats
 
 # --- Helper Functions ---
 
@@ -241,8 +353,6 @@ def main():
                 # Attempt to get them from trainer_config if not on trainer directly (should be set by getParams)
                 trainer.img_cropsize = trainer_config['TrainingData']['crop_size']
                 trainer.norm = trainer_config['TrainingData']['norm']
-                # raise AttributeError("Trainer object is missing 'img_cropsize' or 'norm' attributes from config.")
-
 
             anomaly_map_raw = cal_anomaly_maps(
                 trainer.features_s,
@@ -275,10 +385,117 @@ def main():
             raise TypeError(f"Anomaly map type not recognized: {type(anomaly_map_raw)}")
 
         print("Inference complete. Anomaly map generated.")
+        
+        # --- 5.1. Calculate Adaptive Threshold ---
+        print("\n--- Calculating Adaptive Threshold ---")
+        
+        # Analyze anomaly distribution
+        distribution_stats = analyze_anomaly_distribution(anomaly_map_numpy)
+        if distribution_stats:
+            print(f"Anomaly map statistics:")
+            print(f"  Range: [{distribution_stats['min']:.6f}, {distribution_stats['max']:.6f}]")
+            print(f"  Mean: {distribution_stats['mean']:.6f}, Std: {distribution_stats['std']:.6f}")
+            print(f"  Median: {distribution_stats['median']:.6f}")
+            print(f"  Quartiles: Q1={distribution_stats['q1']:.6f}, Q3={distribution_stats['q3']:.6f}")
+            print(f"  Percentiles: P95={distribution_stats['p95']:.6f}, P99={distribution_stats['p99']:.6f}")
+            
+            # Show potential anomaly percentages
+            for percentile in [90, 95, 99]:
+                pct_key = f'anomaly_pct_p{percentile}'
+                if pct_key in distribution_stats:
+                    print(f"  Anomaly % at P{percentile}: {distribution_stats[pct_key]:.2f}%")
+        
+        # Calculate adaptive threshold using combined method
+        adaptive_threshold = calculate_adaptive_threshold(anomaly_map_numpy, method='combined')
+        print(f"\nRecommended adaptive threshold: {adaptive_threshold:.6f}")
+        
+        # Ask user for threshold choice
+        print(f"\nThreshold options:")
+        print(f"1. Use adaptive threshold: {adaptive_threshold:.6f}")
+        print(f"2. Use default threshold: {INITIAL_THRESHOLD:.6f}")
+        print(f"3. Enter custom threshold")
+        
+        choice = input("Choose threshold option (1/2/3): ").strip()
+        
+        if choice == '1':
+            current_threshold_val = adaptive_threshold
+            print(f"Using adaptive threshold: {current_threshold_val:.6f}")
+        elif choice == '2':
+            current_threshold_val = INITIAL_THRESHOLD
+            print(f"Using default threshold: {current_threshold_val:.6f}")
+        elif choice == '3':
+            try:
+                custom_threshold = float(input("Enter custom threshold value: "))
+                current_threshold_val = custom_threshold
+                print(f"Using custom threshold: {current_threshold_val:.6f}")
+            except ValueError:
+                print("Invalid input, using adaptive threshold as fallback")
+                current_threshold_val = adaptive_threshold
+        else:
+            print("Invalid choice, using adaptive threshold as default")
+            current_threshold_val = adaptive_threshold
+            
     except Exception as e:
         print(f"Error during model inference or post-processing: {e}")
         print("This could be due to an issue with the model architecture, input tensor shape, or trainer methods.")
         return
+
+    # --- 5. Threshold Selection with Adaptive System ---
+    print("\n--- Threshold Selection ---")
+    
+    # Calculate adaptive thresholds
+    adaptive_thresholds = calculate_adaptive_thresholds(anomaly_map_numpy)
+    print("\nAdaptive Threshold Analysis:")
+    print(f"Otsu threshold: {adaptive_thresholds['otsu']:.6f}")
+    print(f"Mean + 2*Std: {adaptive_thresholds['statistical']:.6f}")
+    print(f"95th percentile: {adaptive_thresholds['percentile_95']:.6f}")
+    print(f"99th percentile: {adaptive_thresholds['percentile_99']:.6f}")
+    
+    # Get recommended threshold
+    recommended_threshold = get_recommended_threshold(anomaly_map_numpy)
+    print(f"\nRecommended threshold: {recommended_threshold:.6f}")
+    
+    # Interactive threshold selection
+    print("\nThreshold Selection Options:")
+    print("1. Use recommended adaptive threshold")
+    print("2. Use Otsu threshold")
+    print("3. Use statistical threshold (mean + 2*std)")
+    print("4. Use 95th percentile")
+    print("5. Use 99th percentile")
+    print("6. Enter custom threshold")
+    
+    choice = input("Enter your choice (1-6) [default: 1]: ").strip()
+    
+    if choice == "2":
+        current_threshold_val = adaptive_thresholds['otsu']
+        threshold_method = "Otsu"
+    elif choice == "3":
+        current_threshold_val = adaptive_thresholds['statistical']
+        threshold_method = "Statistical"
+    elif choice == "4":
+        current_threshold_val = adaptive_thresholds['percentile_95']
+        threshold_method = "95th Percentile"
+    elif choice == "5":
+        current_threshold_val = adaptive_thresholds['percentile_99']
+        threshold_method = "99th Percentile"
+    elif choice == "6":
+        try:
+            current_threshold_val = float(input("Enter threshold value: "))
+            threshold_method = "Custom"
+        except ValueError:
+            print("Invalid input. Using recommended threshold.")
+            current_threshold_val = recommended_threshold
+            threshold_method = "Recommended (default)"
+    else:  # Default to recommended
+        current_threshold_val = recommended_threshold
+        threshold_method = "Recommended"
+    
+    print(f"\nSelected threshold: {current_threshold_val:.6f} ({threshold_method})")
+    
+    # Preview the threshold effect
+    binary_preview = (anomaly_map_numpy > current_threshold_val).astype(np.uint8)
+    anomaly_percentage_preview = (np.sum(binary_preview) / binary_preview.size) * 100
+    print(f"Preview: {anomaly_percentage_preview:.2f}% of pixels will be marked as anomalous")
 
     # --- 6. Interactive Thresholding with Slider ---
     print("\n--- Interactive Threshold Adjustment with Slider ---")
@@ -447,6 +664,91 @@ def main():
         print("\\nAnomaly map or original image not available for point extraction.")
 
     print("Script finished.")
+
+    # --- 6. Visualization with Adaptive Threshold ---
+    print("\n--- Creating Visualization ---")
+    
+    # Apply the selected threshold
+    binary_mask = (anomaly_map_numpy > current_threshold_val).astype(np.uint8)
+    anomaly_percentage = (np.sum(binary_mask) / binary_mask.size) * 100
+    
+    # Create overlay
+    overlay_img = input_image.copy()
+    anomaly_overlay = np.zeros_like(input_image)
+    anomaly_overlay[binary_mask == 1] = [0, 0, 255]  # Red for anomalies
+    overlay_img = cv2.addWeighted(overlay_img, 0.7, anomaly_overlay, 0.3, 0)
+    
+    # Create visualization plot
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle(f'Anomaly Detection Results - {threshold_method} Threshold ({current_threshold_val:.6f})', fontsize=16)
+    
+    # Original image
+    axes[0, 0].imshow(cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB))
+    axes[0, 0].set_title('Original Image')
+    axes[0, 0].axis('off')
+    
+    # Anomaly map (heatmap)
+    im1 = axes[0, 1].imshow(anomaly_map_numpy, cmap='hot', interpolation='nearest')
+    axes[0, 1].set_title('Anomaly Heatmap')
+    axes[0, 1].axis('off')
+    plt.colorbar(im1, ax=axes[0, 1], shrink=0.8)
+    
+    # Binary mask
+    axes[0, 2].imshow(binary_mask, cmap='gray')
+    axes[0, 2].set_title(f'Binary Mask\n({anomaly_percentage:.2f}% anomalous)')
+    axes[0, 2].axis('off')
+    
+    # Overlay visualization
+    axes[1, 0].imshow(cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB))
+    axes[1, 0].set_title('Anomaly Overlay')
+    axes[1, 0].axis('off')
+    
+    # Threshold comparison chart
+    thresholds_to_plot = ['otsu', 'statistical', 'percentile_95', 'percentile_99']
+    threshold_values = [adaptive_thresholds[t] for t in thresholds_to_plot]
+    threshold_labels = ['Otsu', 'Statistical', '95th %ile', '99th %ile']
+    
+    bars = axes[1, 1].bar(threshold_labels, threshold_values, alpha=0.7)
+    axes[1, 1].axhline(y=current_threshold_val, color='red', linestyle='--', 
+                       label=f'Selected: {threshold_method}')
+    axes[1, 1].set_title('Threshold Comparison')
+    axes[1, 1].set_ylabel('Threshold Value')
+    axes[1, 1].legend()
+    axes[1, 1].tick_params(axis='x', rotation=45)
+    
+    # Histogram with thresholds
+    axes[1, 2].hist(anomaly_map_numpy.flatten(), bins=50, alpha=0.7, density=True)
+    axes[1, 2].axvline(current_threshold_val, color='red', linestyle='-', linewidth=2,
+                       label=f'Selected ({threshold_method})')
+    axes[1, 2].axvline(adaptive_thresholds['otsu'], color='blue', linestyle='--', 
+                       label='Otsu')
+    axes[1, 2].axvline(adaptive_thresholds['statistical'], color='green', linestyle='--', 
+                       label='Statistical')
+    axes[1, 2].set_title('Anomaly Score Distribution')
+    axes[1, 2].set_xlabel('Anomaly Score')
+    axes[1, 2].set_ylabel('Density')
+    axes[1, 2].legend()
+    
+    plt.tight_layout()
+    
+    # Save the comprehensive visualization
+    timestamp = int(time.time())
+    output_filename = f"anomaly_comparison_{model_name}_{dataset_name}_{timestamp}.png"
+    output_path = os.path.join("results", output_filename)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Comprehensive visualization saved to: {output_path}")
+    
+    plt.show()
+    
+    # Print summary statistics
+    print(f"\n--- Analysis Summary ---")
+    print(f"Model: {model_name}")
+    print(f"Dataset: {dataset_name}")
+    print(f"Threshold method: {threshold_method}")
+    print(f"Threshold value: {current_threshold_val:.6f}")
+    print(f"Anomalous pixels: {anomaly_percentage:.2f}%")
+    print(f"Image dimensions: {input_image.shape}")
+    print(f"Anomaly map range: [{anomaly_map_numpy.min():.6f}, {anomaly_map_numpy.max():.6f}]")
 
 if __name__ == "__main__":
     main()

@@ -33,9 +33,21 @@ class AnomalyVisualizer:
         """Görselleştirici başlat"""
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.supported_models = ["sn", "dbfad", "ead", "rd", "st"]
-        self.threshold = 0.291  # Varsayılan threshold
+        self.threshold = 0.291  # Varsayılan threshold (geriye uyumluluk için)
+        
+        # Adaptif threshold parametreleri
+        self.adaptive_threshold_config = {
+            "use_adaptive": True,
+            "methods": ["percentile", "statistical", "iqr"],
+            "percentile_threshold": 95,  # 95th percentile
+            "std_multiplier": 2.5,      # mean + 2.5*std
+            "iqr_multiplier": 1.5,      # Q3 + 1.5*IQR
+            "min_anomaly_ratio": 0.001, # Minimum %0.1 anomali oranı
+            "combine_method": "mean"     # Methods: "mean", "max", "min"
+        }
         
         print(f"🎨 Anomali Görselleştirici başlatıldı - Cihaz: {self.device}")
+        print(f"🧠 Adaptif threshold sistemi aktif: {self.adaptive_threshold_config['use_adaptive']}")
         
         # Renk paleti ayarla
         plt.style.use('default')
@@ -170,6 +182,17 @@ class AnomalyVisualizer:
             else:
                 print("🟢 Anomali tespit edilmedi")
             
+            # Adaptif threshold hesapla
+            adaptive_results = {}
+            if self.adaptive_threshold_config["use_adaptive"]:
+                adaptive_results = self.calculate_adaptive_threshold(anomaly_map)
+                has_anomaly_adaptive = adaptive_results["adaptive_threshold"] > self.threshold and adaptive_results["adaptive_anomaly_ratio"] > 0.001
+                
+                if has_anomaly_adaptive:
+                    print("🔴 ANOMALİ TESPİT EDİLDİ (ADAPTİF)!")
+                else:
+                    print("🟢 Anomali tespit edilmedi (Adaptif)")
+            
             return {
                 "success": True,
                 "has_anomaly": has_anomaly,
@@ -183,13 +206,130 @@ class AnomalyVisualizer:
                 "original_image": original_image,
                 "model_type": model_type,
                 "dataset": dataset,
-                "image_path": image_path
+                "image_path": image_path,
+                "adaptive_results": adaptive_results if self.adaptive_threshold_config["use_adaptive"] else None
             }
             
         except Exception as e:
             import traceback
             traceback.print_exc()
             return {"success": False, "error": f"Anomali tespit hatası: {str(e)}"}
+    
+    def calculate_adaptive_threshold(self, anomaly_map: np.ndarray) -> Dict:
+        """Adaptif threshold hesapla - yüzdesel sapmaya dayalı"""
+        print("\n🧮 Adaptif Threshold Hesaplaması")
+        print("-" * 40)
+        
+        # Temel istatistikler
+        flat_scores = anomaly_map.flatten()
+        mean_score = np.mean(flat_scores)
+        std_score = np.std(flat_scores)
+        median_score = np.median(flat_scores)
+        
+        # Quartile'lar
+        q1 = np.percentile(flat_scores, 25)
+        q3 = np.percentile(flat_scores, 75)
+        iqr = q3 - q1
+        
+        thresholds = {}
+        
+        # 1. Percentile bazlı threshold
+        percentile_thresh = np.percentile(flat_scores, self.adaptive_threshold_config["percentile_threshold"])
+        thresholds["percentile"] = percentile_thresh
+        
+        # 2. İstatistiksel threshold (mean + k*std)
+        statistical_thresh = mean_score + (self.adaptive_threshold_config["std_multiplier"] * std_score)
+        thresholds["statistical"] = statistical_thresh
+        
+        # 3. IQR bazlı threshold
+        iqr_thresh = q3 + (self.adaptive_threshold_config["iqr_multiplier"] * iqr)
+        thresholds["iqr"] = iqr_thresh
+        
+        # Threshold'ları birleştir
+        selected_methods = self.adaptive_threshold_config["methods"]
+        selected_thresholds = [thresholds[method] for method in selected_methods if method in thresholds]
+        
+        if self.adaptive_threshold_config["combine_method"] == "mean":
+            final_threshold = np.mean(selected_thresholds)
+        elif self.adaptive_threshold_config["combine_method"] == "max":
+            final_threshold = np.max(selected_thresholds)
+        elif self.adaptive_threshold_config["combine_method"] == "min":
+            final_threshold = np.min(selected_thresholds)
+        else:
+            final_threshold = np.mean(selected_thresholds)
+        
+        # Minimum threshold kontrolü (çok düşük olmasın)
+        min_reasonable_threshold = mean_score + 0.5 * std_score
+        final_threshold = max(final_threshold, min_reasonable_threshold)
+        
+        # Sonuçları hesapla
+        adaptive_anomaly_pixels = np.sum(flat_scores > final_threshold)
+        adaptive_anomaly_ratio = adaptive_anomaly_pixels / len(flat_scores)
+        
+        # Orijinal threshold ile karşılaştırma
+        original_anomaly_pixels = np.sum(flat_scores > self.threshold)
+        original_anomaly_ratio = original_anomaly_pixels / len(flat_scores)
+        
+        print(f"📊 Threshold Hesaplamaları:")
+        print(f"   Percentile ({self.adaptive_threshold_config['percentile_threshold']}%): {percentile_thresh:.6f}")
+        print(f"   İstatistiksel (μ + {self.adaptive_threshold_config['std_multiplier']}σ): {statistical_thresh:.6f}")
+        print(f"   IQR (Q3 + {self.adaptive_threshold_config['iqr_multiplier']}*IQR): {iqr_thresh:.6f}")
+        print(f"   🎯 Final Adaptif Threshold: {final_threshold:.6f}")
+        print(f"   📏 Orijinal Threshold: {self.threshold:.6f}")
+        
+        print(f"\n📈 Karşılaştırma:")
+        print(f"   Adaptif → Anomali oranı: {adaptive_anomaly_ratio:.4%} ({adaptive_anomaly_pixels:,} piksel)")
+        print(f"   Orijinal → Anomali oranı: {original_anomaly_ratio:.4%} ({original_anomaly_pixels:,} piksel)")
+        
+        # Hangi yöntemin daha mantıklı olduğunu değerlendir
+        is_adaptive_better = self.evaluate_threshold_quality(flat_scores, final_threshold, self.threshold)
+        
+        return {
+            "adaptive_threshold": final_threshold,
+            "original_threshold": self.threshold,
+            "method_thresholds": thresholds,
+            "adaptive_anomaly_ratio": adaptive_anomaly_ratio,
+            "original_anomaly_ratio": original_anomaly_ratio,
+            "is_adaptive_better": is_adaptive_better,
+            "statistics": {
+                "mean": mean_score,
+                "std": std_score,
+                "median": median_score,
+                "q1": q1,
+                "q3": q3,
+                "iqr": iqr
+            }
+        }
+    
+    def evaluate_threshold_quality(self, scores: np.ndarray, adaptive_thresh: float, original_thresh: float) -> bool:
+        """Threshold kalitesini değerlendir"""
+        
+        # Adaptif threshold ile tespit edilen anomaliler
+        adaptive_anomalies = scores > adaptive_thresh
+        adaptive_ratio = np.mean(adaptive_anomalies)
+        
+        # Orijinal threshold ile tespit edilen anomaliler
+        original_anomalies = scores > original_thresh
+        original_ratio = np.mean(original_anomalies)
+        
+        # Kalite kriterleri
+        criteria = {
+            "reasonable_ratio": 0.001 <= adaptive_ratio <= 0.15,  # %0.1 - %15 arası makul
+            "not_too_sensitive": adaptive_ratio < 0.5,  # Çok hassas olmasın
+            "captures_outliers": adaptive_thresh > np.percentile(scores, 90),  # En üst %10'u yakalasın
+            "better_than_original": adaptive_ratio > 0 and adaptive_ratio != original_ratio
+        }
+        
+        quality_score = sum(criteria.values())
+        is_better = quality_score >= 3  # 4'ten en az 3'ü sağlanmalı
+        
+        print(f"🔍 Threshold Kalite Değerlendirmesi:")
+        for criterion, passed in criteria.items():
+            status = "✅" if passed else "❌"
+            print(f"   {status} {criterion}")
+        print(f"   🎯 Kalite Skoru: {quality_score}/4 - {'Adaptif Daha İyi' if is_better else 'Orijinal Kullan'}")
+        
+        return is_better
     
     def create_comprehensive_visualization(self, result: Dict, save_path: str = None) -> str:
         """Kapsamlı görselleştirme oluştur"""
@@ -405,8 +545,124 @@ class AnomalyVisualizer:
         print("🎉" + "="*48 + "🎉")
         
         return result
-
-
+    
+    def visualize_anomaly(self, image_path: str, model_name: str, save_results: bool = True) -> Dict:
+        """Anomali görselleştirmesi yap"""
+        print(f"\n🔍 Anomali Analizi Başlatılıyor")
+        print(f"📁 Görüntü: {os.path.basename(image_path)}")
+        print(f"🤖 Model: {model_name.upper()}")
+        print("=" * 50)
+        
+        try:
+            # Model ve görüntü yükle
+            model_info = self.load_model(model_name)
+            original_image, processed_image = self.load_and_preprocess_image(image_path)
+            
+            # Anomali haritası oluştur
+            with torch.no_grad():
+                anomaly_map = model_info['model'](processed_image)
+                if isinstance(anomaly_map, tuple):
+                    anomaly_map = anomaly_map[0]
+                
+                # CPU'ya taşı ve numpy'a çevir
+                anomaly_map_np = anomaly_map.squeeze().cpu().numpy()
+                
+                # Orijinal boyutlara yeniden boyutlandır
+                original_height, original_width = original_image.shape[:2]
+                anomaly_map_resized = cv2.resize(anomaly_map_np, (original_width, original_height))
+            
+            # 🧠 Adaptif threshold hesapla
+            threshold_info = {}
+            if self.adaptive_threshold_config["use_adaptive"]:
+                threshold_info = self.calculate_adaptive_threshold(anomaly_map_resized)
+                used_threshold = threshold_info["adaptive_threshold"]
+                threshold_method = "Adaptif"
+                
+                # Eğer adaptif threshold daha iyi değilse orijinali kullan
+                if not threshold_info["is_adaptive_better"]:
+                    print("⚠️  Adaptif threshold kaliteli değil, orijinal threshold kullanılıyor")
+                    used_threshold = self.threshold
+                    threshold_method = "Orijinal"
+            else:
+                used_threshold = self.threshold
+                threshold_method = "Sabit"
+                print(f"📏 Sabit threshold kullanılıyor: {used_threshold:.6f}")
+            
+            # Binary mask oluştur
+            binary_mask = (anomaly_map_resized > used_threshold).astype(np.uint8)
+            
+            # Anomali istatistikleri
+            total_pixels = original_height * original_width
+            anomaly_pixels = np.sum(binary_mask)
+            anomaly_percentage = (anomaly_pixels / total_pixels) * 100
+            
+            print(f"\n📊 Anomali İstatistikleri ({threshold_method} Threshold)")
+            print("-" * 40)
+            print(f"🎯 Kullanılan Threshold: {used_threshold:.6f}")
+            print(f"🔴 Anomali Piksel Sayısı: {anomaly_pixels:,}")
+            print(f"📏 Toplam Piksel: {total_pixels:,}")
+            print(f"📈 Anomali Yüzdesi: {anomaly_percentage:.3f}%")
+            
+            # Anomali seviyesi belirleme (yüzdesel sapmaya göre)
+            if anomaly_percentage < 0.1:
+                severity = "NORMAL"
+                severity_color = "green"
+                severity_emoji = "✅"
+            elif anomaly_percentage < 1.0:
+                severity = "DÜŞÜK RİSK"
+                severity_color = "yellow"
+                severity_emoji = "⚠️"
+            elif anomaly_percentage < 5.0:
+                severity = "ORTA RİSK"
+                severity_color = "orange"
+                severity_emoji = "🟠"
+            else:
+                severity = "YÜKSEK RİSK"
+                severity_color = "red"
+                severity_emoji = "🚨"
+            
+            print(f"🚨 Anomali Seviyesi: {severity_emoji} {severity}")
+            
+            # Görselleştirme
+            if save_results:
+                timestamp = int(time.time())
+                save_path = f"results/anomaly_visualization_{model_name}_{os.path.splitext(os.path.basename(image_path))[0]}_{timestamp}.png"
+                comparison_path = f"results/anomaly_comparison_{model_name}_{os.path.splitext(os.path.basename(image_path))[0]}_{timestamp}.png"
+                
+                self._create_anomaly_visualization(
+                    original_image, anomaly_map_resized, binary_mask, 
+                    save_path, used_threshold, threshold_method, threshold_info
+                )
+                self._create_detailed_comparison(
+                    original_image, anomaly_map_resized, binary_mask,
+                    comparison_path, used_threshold, threshold_method, threshold_info
+                )
+                
+                print(f"\n💾 Sonuçlar Kaydedildi:")
+                print(f"📊 Görselleştirme: {save_path}")
+                print(f"📈 Detaylı Karşılaştırma: {comparison_path}")
+            
+            # Sonuç raporu
+            result = {
+                "model_name": model_name,
+                "image_path": image_path,
+                "threshold_method": threshold_method,
+                "used_threshold": used_threshold,
+                "anomaly_percentage": anomaly_percentage,
+                "anomaly_pixels": int(anomaly_pixels),
+                "total_pixels": int(total_pixels),
+                "severity": severity,
+                "severity_color": severity_color,
+                "threshold_info": threshold_info
+            }
+            
+            return result
+            
+        except Exception as e:
+            print(f"❌ Hata oluştu: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
 def main():
     """Ana fonksiyon"""
     import time
