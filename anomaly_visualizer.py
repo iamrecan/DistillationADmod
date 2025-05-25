@@ -5,6 +5,7 @@ Anomali tespit sonuçlarını detaylı şekilde görselleştir ve karşılaştı
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import cv2
 import os
@@ -17,6 +18,7 @@ import matplotlib.patches as patches
 import torchvision.transforms as transforms
 from typing import Dict, List, Optional, Tuple
 import seaborn as sns
+from sklearn.cluster import KMeans
 
 # Kendi modüllerimizi import et
 from models.SingleNet.trainer_sn import SnTrainer
@@ -92,14 +94,39 @@ class AnomalyVisualizer:
         return image
     
     def detect_anomalies(self, image_path: str, model_type: str, dataset: str) -> Dict:
-        """Anomali tespiti yap ve sonuçları döndür"""
+        """Anomali tespiti yap - Normalize edilmemiş anomaly map ile"""
         print("\n" + "="*60)
-        print("🔍 ANOMALİ TESPİTİ VE GÖRSELLEŞTİRME")
+        print("🔍 ANOMALİ TESPİTİ (Gerçek Anomali Haritası)")
         print("="*60)
         
         try:
-            # Import the anomaly calculation function
-            from utils.functions import cal_anomaly_maps
+            # Custom anomaly calculation function - without normalization
+            def calculate_raw_anomaly_map(fs_list, ft_list, out_size, norm):
+                """Normalizasyon olmadan anomali haritası hesapla"""
+                anomaly_map = 0
+                for i in range(len(ft_list)):
+                    fs = fs_list[i]
+                    ft = ft_list[i]
+                    fs_norm = F.normalize(fs, p=2) if norm else fs
+                    ft_norm = F.normalize(ft, p=2) if norm else ft
+
+                    # Normalizasyonsuz anomali haritası
+                    a_map = 0.5 * (ft_norm - fs_norm) ** 2
+                    a_map = a_map.sum(1, keepdim=True)
+                    a_map = F.interpolate(a_map, size=out_size, mode="bilinear", align_corners=False)
+                    anomaly_map += a_map
+                
+                anomaly_map = anomaly_map.squeeze().cpu().numpy()
+                
+                # Gaussian filter uygula (opsiyonel)
+                from scipy.ndimage import gaussian_filter
+                if len(anomaly_map.shape) == 2:
+                    anomaly_map = gaussian_filter(anomaly_map, sigma=4)
+                else:
+                    for i in range(anomaly_map.shape[0]):
+                        anomaly_map[i] = gaussian_filter(anomaly_map[i], sigma=4)
+                
+                return anomaly_map
             
             # Konfigürasyon hazırla
             config = {
@@ -143,8 +170,8 @@ class AnomalyVisualizer:
                 trainer.infer(image_tensor)
                 trainer.post_process()
                 
-                # Anomaly map hesapla
-                anomaly_map = cal_anomaly_maps(
+                # Raw anomaly map hesapla (normalizasyon yok)
+                anomaly_map = calculate_raw_anomaly_map(
                     trainer.features_s,
                     trainer.features_t,
                     out_size=224,
@@ -159,39 +186,103 @@ class AnomalyVisualizer:
             max_anomaly = np.max(anomaly_map)
             mean_anomaly = np.mean(anomaly_map)
             std_anomaly = np.std(anomaly_map)
-            anomaly_pixels = np.sum(anomaly_map > self.threshold)
-            total_pixels = anomaly_map.size
-            anomaly_ratio = anomaly_pixels / total_pixels
+            min_anomaly = np.min(anomaly_map)
             
             # Percentile'ları hesapla
             percentiles = np.percentile(anomaly_map, [50, 75, 90, 95, 99])
             
-            print(f"📊 Anomali İstatistikleri:")
-            print(f"   Maksimum skor: {max_anomaly:.6f}")
-            print(f"   Ortalama skor: {mean_anomaly:.6f}")
-            print(f"   Standart sapma: {std_anomaly:.6f}")
-            print(f"   Threshold: {self.threshold}")
-            print(f"   Anomali pikselleri: {anomaly_pixels}/{total_pixels} ({anomaly_ratio:.2%})")
-            print(f"   Percentiles [50,75,90,95,99]: {percentiles}")
+            print(f"📊 Gerçek Anomali İstatistikleri:")
+            print(f"   📏 Min/Max: [{min_anomaly:.6f}, {max_anomaly:.6f}]")
+            print(f"   📈 Mean ± Std: {mean_anomaly:.6f} ± {std_anomaly:.6f}")
+            print(f"   📊 Percentiles [50,75,90,95,99]: {percentiles}")
+            
+            # Dinamik threshold hesapla (istatistiksel yaklaşım)
+            # 1. Otsu threshold benzeri yaklaşım
+            flat_scores = anomaly_map.flatten().reshape(-1, 1)
+            
+            # K-means ile 2 cluster (normal vs anomali)
+            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(flat_scores)
+            cluster_centers = kmeans.cluster_centers_.flatten()
+            
+            # Yüksek cluster'ın merkezini threshold olarak kullan
+            otsu_threshold = np.max(cluster_centers)
+            
+            # Alternatif thresholdlar
+            percentile_95_threshold = np.percentile(anomaly_map, 95)
+            statistical_threshold = mean_anomaly + 2.5 * std_anomaly
+            
+            print(f"\n🧠 Dinamik Threshold Hesaplamaları:")
+            print(f"   🎯 K-means (Otsu benzeri): {otsu_threshold:.6f}")
+            print(f"   📊 Percentile 95%: {percentile_95_threshold:.6f}")
+            print(f"   📈 İstatistiksel (μ + 2.5σ): {statistical_threshold:.6f}")
+            
+            # En iyi threshold'u seç
+            candidate_thresholds = [otsu_threshold, percentile_95_threshold, statistical_threshold]
+            
+            # Her threshold için anomali oranını hesapla
+            threshold_results = {}
+            for i, thresh in enumerate(candidate_thresholds):
+                anomaly_count = np.sum(anomaly_map > thresh)
+                anomaly_ratio = anomaly_count / anomaly_map.size
+                threshold_results[i] = {
+                    "threshold": thresh,
+                    "anomaly_ratio": anomaly_ratio,
+                    "anomaly_count": anomaly_count
+                }
+                
+                method_names = ["K-means", "Percentile95", "Statistical"]
+                print(f"   {method_names[i]} → Anomali oranı: {anomaly_ratio:.4%} ({anomaly_count:,} piksel)")
+            
+            # Makul anomali oranına sahip threshold'u seç (0.1% - 10% arası)
+            best_threshold = statistical_threshold  # varsayılan
+            best_method = "Statistical"
+            
+            for i, result in threshold_results.items():
+                ratio = result["anomaly_ratio"]
+                if 0.001 <= ratio <= 0.1:  # %0.1 - %10 arası makul
+                    best_threshold = result["threshold"]
+                    best_method = ["K-means", "Percentile95", "Statistical"][i]
+                    break
+            
+            # Final hesaplamalar
+            final_anomaly_pixels = np.sum(anomaly_map > best_threshold)
+            final_anomaly_ratio = final_anomaly_pixels / anomaly_map.size
+            
+            print(f"\n🎯 Final Threshold Seçimi:")
+            print(f"   ✅ Seçilen yöntem: {best_method}")
+            print(f"   🎯 Threshold: {best_threshold:.6f}")
+            print(f"   🔴 Anomali pikselleri: {final_anomaly_pixels:,}/{anomaly_map.size:,}")
+            print(f"   📊 Anomali oranı: {final_anomaly_ratio:.4%}")
             
             # Anomali var mı?
-            has_anomaly = max_anomaly > self.threshold and anomaly_ratio > 0.001
+            has_anomaly = final_anomaly_ratio > 0.001  # En az %0.1
             
             if has_anomaly:
                 print("🔴 ANOMALİ TESPİT EDİLDİ!")
             else:
                 print("🟢 Anomali tespit edilmedi")
             
-            # Adaptif threshold hesapla
-            adaptive_results = {}
-            if self.adaptive_threshold_config["use_adaptive"]:
-                adaptive_results = self.calculate_adaptive_threshold(anomaly_map)
-                has_anomaly_adaptive = adaptive_results["adaptive_threshold"] > self.threshold and adaptive_results["adaptive_anomaly_ratio"] > 0.001
+            # Anomali bölgelerini analiz et
+            binary_mask = (anomaly_map > best_threshold).astype(np.uint8)
+            
+            # Connected components analizi
+            import cv2
+            num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(binary_mask)
+            
+            print(f"\n🔍 Anomali Bölge Analizi:")
+            print(f"   🏷️  Tespit edilen bölge sayısı: {num_labels - 1}")  # -1 çünkü background dahil
+            
+            if num_labels > 1:
+                # En büyük bölgeleri listele
+                areas = stats[1:, cv2.CC_STAT_AREA]  # Background hariç
+                largest_areas = np.argsort(areas)[::-1][:3]  # En büyük 3 bölge
                 
-                if has_anomaly_adaptive:
-                    print("🔴 ANOMALİ TESPİT EDİLDİ (ADAPTİF)!")
-                else:
-                    print("🟢 Anomali tespit edilmedi (Adaptif)")
+                for i, area_idx in enumerate(largest_areas):
+                    actual_idx = area_idx + 1  # Background offset
+                    area = stats[actual_idx, cv2.CC_STAT_AREA]
+                    x, y = int(centroids[actual_idx][0]), int(centroids[actual_idx][1])
+                    print(f"   {i+1}. Bölge: {area} piksel, merkez: ({x}, {y})")
             
             return {
                 "success": True,
@@ -199,15 +290,24 @@ class AnomalyVisualizer:
                 "max_score": float(max_anomaly),
                 "mean_score": float(mean_anomaly),
                 "std_score": float(std_anomaly),
-                "threshold": self.threshold,
-                "anomaly_ratio": float(anomaly_ratio),
+                "min_score": float(min_anomaly),
+                "threshold": best_threshold,
+                "threshold_method": best_method,
+                "anomaly_ratio": float(final_anomaly_ratio),
+                "anomaly_count": int(final_anomaly_pixels),
                 "percentiles": percentiles.tolist(),
                 "anomaly_map": anomaly_map,
+                "binary_mask": binary_mask,
                 "original_image": original_image,
                 "model_type": model_type,
                 "dataset": dataset,
                 "image_path": image_path,
-                "adaptive_results": adaptive_results if self.adaptive_threshold_config["use_adaptive"] else None
+                "num_regions": int(num_labels - 1),
+                "threshold_candidates": {
+                    "kmeans": float(otsu_threshold),
+                    "percentile95": float(percentile_95_threshold),
+                    "statistical": float(statistical_threshold)
+                }
             }
             
         except Exception as e:
@@ -216,9 +316,9 @@ class AnomalyVisualizer:
             return {"success": False, "error": f"Anomali tespit hatası: {str(e)}"}
     
     def calculate_adaptive_threshold(self, anomaly_map: np.ndarray) -> Dict:
-        """Adaptif threshold hesapla - yüzdesel sapmaya dayalı"""
-        print("\n🧮 Adaptif Threshold Hesaplaması")
-        print("-" * 40)
+        """🧠 Adaptif threshold hesapla - normalized anomaly score mantığı"""
+        print("\n🧮 Adaptif Threshold Hesaplaması (Normalized Anomaly Score)")
+        print("-" * 60)
         
         # Temel istatistikler
         flat_scores = anomaly_map.flatten()
@@ -230,6 +330,12 @@ class AnomalyVisualizer:
         q1 = np.percentile(flat_scores, 25)
         q3 = np.percentile(flat_scores, 75)
         iqr = q3 - q1
+        
+        print(f"📊 Temel İstatistikler:")
+        print(f"   📏 Min/Max: [{np.min(flat_scores):.6f}, {np.max(flat_scores):.6f}]")
+        print(f"   📈 Mean ± Std: {mean_score:.6f} ± {std_score:.6f}")
+        print(f"   📊 Median: {median_score:.6f}")
+        print(f"   📦 Q1/Q3: [{q1:.6f}, {q3:.6f}], IQR: {iqr:.6f}")
         
         thresholds = {}
         
@@ -262,6 +368,10 @@ class AnomalyVisualizer:
         min_reasonable_threshold = mean_score + 0.5 * std_score
         final_threshold = max(final_threshold, min_reasonable_threshold)
         
+        # 🎯 Normalized Anomaly Score hesaplama
+        normalized_scores = (flat_scores - mean_score) / (std_score + 1e-8)  # Z-score normalizasyonu
+        normalized_threshold = (final_threshold - mean_score) / (std_score + 1e-8)
+        
         # Sonuçları hesapla
         adaptive_anomaly_pixels = np.sum(flat_scores > final_threshold)
         adaptive_anomaly_ratio = adaptive_anomaly_pixels / len(flat_scores)
@@ -270,16 +380,17 @@ class AnomalyVisualizer:
         original_anomaly_pixels = np.sum(flat_scores > self.threshold)
         original_anomaly_ratio = original_anomaly_pixels / len(flat_scores)
         
-        print(f"📊 Threshold Hesaplamaları:")
-        print(f"   Percentile ({self.adaptive_threshold_config['percentile_threshold']}%): {percentile_thresh:.6f}")
-        print(f"   İstatistiksel (μ + {self.adaptive_threshold_config['std_multiplier']}σ): {statistical_thresh:.6f}")
-        print(f"   IQR (Q3 + {self.adaptive_threshold_config['iqr_multiplier']}*IQR): {iqr_thresh:.6f}")
+        print(f"\n🔬 Threshold Hesaplamaları:")
+        print(f"   📊 Percentile ({self.adaptive_threshold_config['percentile_threshold']}%): {percentile_thresh:.6f}")
+        print(f"   📈 İstatistiksel (μ + {self.adaptive_threshold_config['std_multiplier']}σ): {statistical_thresh:.6f}")
+        print(f"   📦 IQR (Q3 + {self.adaptive_threshold_config['iqr_multiplier']}*IQR): {iqr_thresh:.6f}")
         print(f"   🎯 Final Adaptif Threshold: {final_threshold:.6f}")
         print(f"   📏 Orijinal Threshold: {self.threshold:.6f}")
+        print(f"   🧠 Normalized Threshold (Z-score): {normalized_threshold:.3f}")
         
         print(f"\n📈 Karşılaştırma:")
-        print(f"   Adaptif → Anomali oranı: {adaptive_anomaly_ratio:.4%} ({adaptive_anomaly_pixels:,} piksel)")
-        print(f"   Orijinal → Anomali oranı: {original_anomaly_ratio:.4%} ({original_anomaly_pixels:,} piksel)")
+        print(f"   🔴 Adaptif → Anomali oranı: {adaptive_anomaly_ratio:.4%} ({adaptive_anomaly_pixels:,} piksel)")
+        print(f"   🔵 Orijinal → Anomali oranı: {original_anomaly_ratio:.4%} ({original_anomaly_pixels:,} piksel)")
         
         # Hangi yöntemin daha mantıklı olduğunu değerlendir
         is_adaptive_better = self.evaluate_threshold_quality(flat_scores, final_threshold, self.threshold)
@@ -287,6 +398,8 @@ class AnomalyVisualizer:
         return {
             "adaptive_threshold": final_threshold,
             "original_threshold": self.threshold,
+            "normalized_threshold": normalized_threshold,
+            "normalized_scores": normalized_scores,
             "method_thresholds": thresholds,
             "adaptive_anomaly_ratio": adaptive_anomaly_ratio,
             "original_anomaly_ratio": original_anomaly_ratio,
@@ -297,12 +410,14 @@ class AnomalyVisualizer:
                 "median": median_score,
                 "q1": q1,
                 "q3": q3,
-                "iqr": iqr
+                "iqr": iqr,
+                "min": np.min(flat_scores),
+                "max": np.max(flat_scores)
             }
         }
     
     def evaluate_threshold_quality(self, scores: np.ndarray, adaptive_thresh: float, original_thresh: float) -> bool:
-        """Threshold kalitesini değerlendir"""
+        """🔍 Threshold kalitesini değerlendir - normalized anomaly score kriterlerine göre"""
         
         # Adaptif threshold ile tespit edilen anomaliler
         adaptive_anomalies = scores > adaptive_thresh
@@ -312,25 +427,243 @@ class AnomalyVisualizer:
         original_anomalies = scores > original_thresh
         original_ratio = np.mean(original_anomalies)
         
-        # Kalite kriterleri
+        # Normalized score kalite kriterleri (5 kriter)
         criteria = {
             "reasonable_ratio": 0.001 <= adaptive_ratio <= 0.15,  # %0.1 - %15 arası makul
             "not_too_sensitive": adaptive_ratio < 0.5,  # Çok hassas olmasın
             "captures_outliers": adaptive_thresh > np.percentile(scores, 90),  # En üst %10'u yakalasın
-            "better_than_original": adaptive_ratio > 0 and adaptive_ratio != original_ratio
+            "better_than_original": adaptive_ratio > 0 and abs(adaptive_ratio - original_ratio) > 0.001,
+            "statistical_significance": adaptive_thresh > np.mean(scores) + 2 * np.std(scores)  # İstatistiksel anlamlılık
         }
         
         quality_score = sum(criteria.values())
-        is_better = quality_score >= 3  # 4'ten en az 3'ü sağlanmalı
+        is_better = quality_score >= 3  # 5'ten en az 3'ü sağlanmalı
         
-        print(f"🔍 Threshold Kalite Değerlendirmesi:")
+        print(f"\n🔍 Threshold Kalite Değerlendirmesi:")
         for criterion, passed in criteria.items():
             status = "✅" if passed else "❌"
-            print(f"   {status} {criterion}")
-        print(f"   🎯 Kalite Skoru: {quality_score}/4 - {'Adaptif Daha İyi' if is_better else 'Orijinal Kullan'}")
+            print(f"   {status} {criterion.replace('_', ' ').title()}")
+        print(f"   🎯 Kalite Skoru: {quality_score}/5 - {'🟢 Adaptif Daha İyi' if is_better else '🔵 Orijinal Kullan'}")
         
         return is_better
     
+    def calculate_normalized_anomaly_scores(self, anomaly_map: np.ndarray, threshold: float) -> np.ndarray:
+        """Normalized anomaly scores hesapla (Z-score)"""
+        mean = np.mean(anomaly_map)
+        std = np.std(anomaly_map)
+        
+        # Z-score hesapla
+        z_scores = (anomaly_map - mean) / (std + 1e-8)  # Avoid division by zero
+        
+        # Anomali skoru eşik değerine göre ayarla
+        adjusted_scores = np.where(z_scores > threshold, z_scores, 0)
+        
+        return adjusted_scores
+
+    def load_model(self, model_name: str) -> Dict:
+        """Model yükleme metodu (visualize_anomaly için gerekli)"""
+        # Bu metod visualize_anomaly fonksiyonu için gerekli
+        # Gerçek implementasyon analyze_and_visualize'da yapılıyor
+        return {"model": None}
+    
+    def load_and_preprocess_image(self, image_path: str) -> Tuple[np.ndarray, torch.Tensor]:
+        """Görüntü yükleme ve ön işleme (visualize_anomaly için gerekli)"""
+        original_image = self.load_original_image(image_path)
+        processed_image = self.preprocess_image(image_path)
+        return original_image, processed_image
+
+    def _create_anomaly_visualization(self, original_image: np.ndarray, anomaly_map: np.ndarray, 
+                                    binary_mask: np.ndarray, save_path: str, threshold: float,
+                                    threshold_method: str, threshold_info: Dict) -> None:
+        """Detaylı anomali görselleştirmesi oluştur"""
+        fig = plt.figure(figsize=(20, 12))
+        fig.suptitle(f'🔍 Detaylı Anomali Analizi - {threshold_method} Threshold\n'
+                    f'Dosya: {os.path.basename(save_path)}', fontsize=16, fontweight='bold')
+        
+        # 1. Orijinal Görüntü
+        plt.subplot(2, 4, 1)
+        plt.imshow(original_image)
+        plt.title('1. Orijinal Görüntü', fontsize=12, fontweight='bold')
+        plt.axis('off')
+        
+        # 2. Anomali Haritası (Ham)
+        plt.subplot(2, 4, 2)
+        im2 = plt.imshow(anomaly_map, cmap='hot', interpolation='bilinear')
+        plt.title(f'2. Anomali Haritası\nMax: {np.max(anomaly_map):.6f}', fontsize=12, fontweight='bold')
+        plt.colorbar(im2, fraction=0.046, pad=0.04)
+        plt.axis('off')
+        
+        # 3. Binary Mask
+        plt.subplot(2, 4, 3)
+        plt.imshow(binary_mask, cmap='binary')
+        plt.title(f'3. Binary Mask\n(Threshold: {threshold:.6f})', fontsize=12, fontweight='bold')
+        plt.axis('off')
+        
+        # 4. Overlay
+        plt.subplot(2, 4, 4)
+        plt.imshow(original_image)
+        anomaly_normalized = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min() + 1e-8)
+        plt.imshow(anomaly_normalized, cmap='hot', alpha=0.5, interpolation='bilinear')
+        plt.title('4. Overlay Görünümü', fontsize=12, fontweight='bold')
+        plt.axis('off')
+        
+        # 5. Histogram
+        plt.subplot(2, 4, 5)
+        plt.hist(anomaly_map.flatten(), bins=50, alpha=0.7, color='blue', edgecolor='black')
+        plt.axvline(threshold, color='red', linestyle='--', linewidth=2, 
+                   label=f'{threshold_method} Threshold: {threshold:.6f}')
+        if threshold_info and "original_threshold" in threshold_info:
+            plt.axvline(threshold_info["original_threshold"], color='orange', linestyle=':', linewidth=2,
+                       label=f'Orijinal Threshold: {threshold_info["original_threshold"]:.6f}')
+        plt.xlabel('Anomali Skoru')
+        plt.ylabel('Frekans')
+        plt.title('5. Skor Dağılımı', fontsize=12, fontweight='bold')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 6. Contour Görünümü
+        plt.subplot(2, 4, 6)
+        plt.imshow(original_image)
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            if cv2.contourArea(contour) > 10:  # Küçük gürültüleri filtrele
+                plt.plot(contour[:, 0, 0], contour[:, 0, 1], 'r-', linewidth=2)
+        plt.title('6. Anomali Konturları', fontsize=12, fontweight='bold')
+        plt.axis('off')
+        
+        # 7. İstatistik Tablosu
+        ax7 = plt.subplot(2, 4, 7)
+        ax7.axis('off')
+        
+        stats_text = f"""📊 THRESHOLD ANALİZİ
+
+🎯 Kullanılan Yöntem: {threshold_method}
+📏 Threshold Değeri: {threshold:.6f}
+
+📈 ANOMALİ İSTATİSTİKLERİ:
+• Toplam Piksel: {anomaly_map.size:,}
+• Anomali Piksel: {np.sum(binary_mask):,}
+• Anomali Oranı: {(np.sum(binary_mask)/anomaly_map.size)*100:.3f}%
+
+📊 SKOR İSTATİSTİKLERİ:
+• Min Skor: {np.min(anomaly_map):.6f}
+• Max Skor: {np.max(anomaly_map):.6f}
+• Ortalama: {np.mean(anomaly_map):.6f}
+• Std. Sapma: {np.std(anomaly_map):.6f}
+
+🔬 PERCENTILES:
+• 50%: {np.percentile(anomaly_map, 50):.6f}
+• 90%: {np.percentile(anomaly_map, 90):.6f}
+• 95%: {np.percentile(anomaly_map, 95):.6f}
+• 99%: {np.percentile(anomaly_map, 99):.6f}
+        """
+        
+        if threshold_info and "method_thresholds" in threshold_info:
+            stats_text += f"\n🧠 ADAPTİF THRESHOLD BİLGİLERİ:\n"
+            for method, value in threshold_info["method_thresholds"].items():
+                stats_text += f"• {method.title()}: {value:.6f}\n"
+        
+        ax7.text(0.05, 0.95, stats_text, transform=ax7.transAxes, fontsize=9,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle="round,pad=0.5", facecolor="lightblue", alpha=0.8))
+        
+        # 8. Anomali Bölge Analizi
+        ax8 = plt.subplot(2, 4, 8)
+        ax8.axis('off')
+        
+        # Contour alanları analiz et
+        total_anomaly_area = np.sum(binary_mask)
+        num_contours = len([c for c in contours if cv2.contourArea(c) > 10])
+        largest_contour_area = max([cv2.contourArea(c) for c in contours], default=0)
+        
+        area_text = f"""🔍 BÖLGE ANALİZİ
+
+🏷️ Tespit Edilen Bölgeler: {num_contours}
+📐 Toplam Anomali Alanı: {total_anomaly_area:,} piksel
+📏 En Büyük Bölge: {largest_contour_area:.0f} piksel
+
+💡 DEĞERLENDİRME:
+"""
+        
+        if total_anomaly_area == 0:
+            area_text += "✅ Anomali tespit edilmedi"
+        elif total_anomaly_area < 100:
+            area_text += "⚠️ Küçük anomali bölgeleri"
+        elif total_anomaly_area < 1000:
+            area_text += "🟠 Orta büyüklükte anomali"
+        else:
+            area_text += "🚨 Büyük anomali bölgesi"
+        
+        if threshold_info and "is_adaptive_better" in threshold_info:
+            area_text += f"\n\n🧠 Adaptif Threshold: {'✅ Daha İyi' if threshold_info['is_adaptive_better'] else '❌ Orijinal Tercih'}"
+        
+        ax8.text(0.05, 0.95, area_text, transform=ax8.transAxes, fontsize=9,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle="round,pad=0.5", facecolor="lightyellow", alpha=0.8))
+        
+        plt.tight_layout()
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close()
+
+    def _create_detailed_comparison(self, original_image: np.ndarray, anomaly_map: np.ndarray,
+                                  binary_mask: np.ndarray, save_path: str, threshold: float,
+                                  threshold_method: str, threshold_info: Dict) -> None:
+        """Detaylı karşılaştırma görselleştirmesi"""
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        fig.suptitle(f'🔄 Threshold Karşılaştırması - {threshold_method}\n'
+                    f'Dosya: {os.path.basename(save_path)}', fontsize=16, fontweight='bold')
+        
+        # Üst sıra: Adaptif threshold ile
+        axes[0, 0].imshow(original_image)
+        axes[0, 0].set_title(f'Orijinal Görüntü', fontsize=12, fontweight='bold')
+        axes[0, 0].axis('off')
+        
+        axes[0, 1].imshow(anomaly_map, cmap='jet')
+        axes[0, 1].set_title(f'Anomali Haritası\nMax: {result["max_score"]:.6f}', fontsize=12, fontweight='bold')
+        axes[0, 1].axis('off')
+        
+        axes[0, 2].imshow(binary_mask, cmap='binary')
+        axes[0, 2].set_title(f'{threshold_method} Threshold\n({threshold:.6f})', fontsize=12, fontweight='bold')
+        axes[0, 2].axis('off')
+        
+        # Alt sıra: Orijinal threshold ile (karşılaştırma için)
+        if threshold_info and "original_threshold" in threshold_info:
+            original_threshold = threshold_info["original_threshold"]
+            original_binary = (anomaly_map > original_threshold).astype(np.uint8)
+            
+            axes[1, 0].imshow(original_image)
+            overlay = original_image.copy()
+            overlay[binary_mask > 0] = [255, 0, 0]  # Kırmızı overlay
+            axes[1, 0].imshow(overlay, alpha=0.7)
+            axes[1, 0].set_title(f'{threshold_method} Overlay', fontsize=12, fontweight='bold')
+            axes[1, 0].axis('off')
+            
+            axes[1, 1].imshow(original_binary, cmap='binary')
+            axes[1, 1].set_title(f'Orijinal Threshold\n({original_threshold:.6f})', fontsize=12, fontweight='bold')
+            axes[1, 1].axis('off')
+            
+            # Fark analizi
+            diff_mask = np.abs(binary_mask.astype(int) - original_binary.astype(int))
+            axes[1, 2].imshow(diff_mask, cmap='RdYlBu')
+            axes[1, 2].set_title('Threshold Farkları\n(Mavi: Orijinal, Kırmızı: Adaptif)', fontsize=12, fontweight='bold')
+            axes[1, 2].axis('off')
+        else:
+            # Orijinal threshold bilgisi yoksa histogram göster
+            axes[1, 0].hist(anomaly_map.flatten(), bins=50, alpha=0.7, color='blue')
+            axes[1, 0].axvline(threshold, color='red', linestyle='--', linewidth=2)
+            axes[1, 0].set_title('Skor Dağılımı ve Threshold', fontsize=12, fontweight='bold')
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # Boş alanları gizle
+            axes[1, 1].axis('off')
+            axes[1, 2].axis('off')
+        
+        plt.tight_layout()
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close()
+
     def create_comprehensive_visualization(self, result: Dict, save_path: str = None) -> str:
         """Kapsamlı görselleştirme oluştur"""
         if not result["success"]:
@@ -578,7 +911,7 @@ class AnomalyVisualizer:
                 used_threshold = threshold_info["adaptive_threshold"]
                 threshold_method = "Adaptif"
                 
-                # Eğer adaptif threshold daha iyi değilse orijinali kullan
+                # Eğer adaptif threshold daha iyi değilse orijinalini kullan
                 if not threshold_info["is_adaptive_better"]:
                     print("⚠️  Adaptif threshold kaliteli değil, orijinal threshold kullanılıyor")
                     used_threshold = self.threshold
