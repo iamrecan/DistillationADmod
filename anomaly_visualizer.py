@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-🎨 ANOMALİ GÖRSELLEŞTIRME ARACI
+🎨 ANOMALİ GÖRSELLEŞTİRME ARACI
 Anomali tespit sonuçlarını detaylı şekilde görselleştir ve karşılaştır
 """
 
@@ -11,6 +11,8 @@ import cv2
 import os
 import sys
 import time
+import random
+import traceback
 from pathlib import Path
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -93,14 +95,66 @@ class AnomalyVisualizer:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         return image
     
-    def detect_anomalies(self, image_path: str, model_type: str, dataset: str) -> Dict:
-        """Anomali tespiti yap - Normalize edilmemiş anomaly map ile"""
-        print("\n" + "="*60)
-        print("🔍 ANOMALİ TESPİTİ (Gerçek Anomali Haritası)")
-        print("="*60)
+    def calibrate_threshold_on_normal_images(self, model_type: str, dataset: str, num_samples: int = 10) -> Dict:
+        """Normal görüntüler üzerinde threshold kalibrasyonu yap"""
+        print(f"\n🎯 THRESHOLD KALİBRASYONU")
+        print(f"📊 Dataset: {dataset}")
+        print(f"🤖 Model: {model_type}")
+        print(f"📁 Örneklem: {num_samples} normal görüntü")
+        print("-" * 50)
         
         try:
-            # Custom anomaly calculation function - without normalization
+            # Normal görüntü dizinini kontrol et
+            normal_dir = Path(f"dataset/{dataset}/test/good")
+            if not normal_dir.exists():
+                return {
+                    "success": False,
+                    "error": f"Normal görüntü dizini bulunamadı: {normal_dir}"
+                }
+            
+            # Normal görüntüleri listele
+            normal_images = list(normal_dir.glob("*.png")) + list(normal_dir.glob("*.jpg"))
+            if len(normal_images) == 0:
+                return {
+                    "success": False,
+                    "error": f"Normal görüntü bulunamadı: {normal_dir}"
+                }
+            
+            # Örneklem seç
+            selected_images = random.sample(normal_images, min(num_samples, len(normal_images)))
+            print(f"✅ {len(selected_images)} normal görüntü seçildi")
+            
+            # Model yükle
+            config = {
+                "data_path": f"./dataset",
+                "obj": dataset,
+                "save_path": "./results",
+                "distillType": model_type,
+                "inference_only_mode": True,
+                "TrainingData": {
+                    "epochs": 100,
+                    "batch_size": 32,
+                    "lr": 0.0004,
+                    "img_size": 224,
+                    "crop_size": 224,
+                    "norm": True
+                }
+            }
+            
+            trainer = self.load_anomaly_model(model_type, config)
+            trainer.model_dir = f"./results/models/{dataset}/{model_type}"
+            
+            model_path = Path(f"results/models/{dataset}/{model_type}/student.pth")
+            if not model_path.exists():
+                return {
+                    "success": False,
+                    "error": f"Model ağırlıkları bulunamadı: {model_path}"
+                }
+            
+            trainer.load_weights()
+            trainer.change_mode("eval")
+            
+            # Custom anomaly calculation function
             def calculate_raw_anomaly_map(fs_list, ft_list, out_size, norm):
                 """Normalizasyon olmadan anomali haritası hesapla"""
                 anomaly_map = 0
@@ -110,7 +164,6 @@ class AnomalyVisualizer:
                     fs_norm = F.normalize(fs, p=2) if norm else fs
                     ft_norm = F.normalize(ft, p=2) if norm else ft
 
-                    # Normalizasyonsuz anomali haritası
                     a_map = 0.5 * (ft_norm - fs_norm) ** 2
                     a_map = a_map.sum(1, keepdim=True)
                     a_map = F.interpolate(a_map, size=out_size, mode="bilinear", align_corners=False)
@@ -118,14 +171,207 @@ class AnomalyVisualizer:
                 
                 anomaly_map = anomaly_map.squeeze().cpu().numpy()
                 
-                # Gaussian filter uygula (opsiyonel)
+                # Gaussian filter uygula
                 from scipy.ndimage import gaussian_filter
                 if len(anomaly_map.shape) == 2:
                     anomaly_map = gaussian_filter(anomaly_map, sigma=4)
                 else:
                     for i in range(anomaly_map.shape[0]):
                         anomaly_map[i] = gaussian_filter(anomaly_map[i], sigma=4)
+
+                return anomaly_map
+            
+            # Normal görüntüler üzerinde analiz
+            all_normal_scores = []
+            normal_stats = []
+            
+            print("🔍 Normal görüntüler analiz ediliyor...")
+            
+            for i, img_path in enumerate(selected_images):
+                print(f"   📸 {i+1}/{len(selected_images)}: {img_path.name}")
                 
+                # Görüntüyü işle
+                image_tensor = self.preprocess_image(str(img_path))
+                
+                # Inference
+                with torch.no_grad():
+                    trainer.infer(image_tensor)
+                    trainer.post_process()
+                    
+                    # Raw anomaly map hesapla
+                    anomaly_map = calculate_raw_anomaly_map(
+                        trainer.features_s,
+                        trainer.features_t,
+                        out_size=224,
+                        norm=trainer.norm
+                    )
+                
+                if len(anomaly_map.shape) == 3:
+                    anomaly_map = anomaly_map[0]
+                
+                # İstatistikleri topla
+                flat_scores = anomaly_map.flatten()
+                all_normal_scores.extend(flat_scores)
+                
+                stats = {
+                    "image": img_path.name,
+                    "mean": np.mean(flat_scores),
+                    "std": np.std(flat_scores),
+                    "max": np.max(flat_scores),
+                    "min": np.min(flat_scores),
+                    "p95": np.percentile(flat_scores, 95),
+                    "p99": np.percentile(flat_scores, 99)
+                }
+                normal_stats.append(stats)
+                
+                print(f"      📊 Mean: {stats['mean']:.6f}, Max: {stats['max']:.6f}, P99: {stats['p99']:.6f}")
+            
+            # Genel istatistikler
+            all_normal_scores = np.array(all_normal_scores)
+            global_mean = np.mean(all_normal_scores)
+            global_std = np.std(all_normal_scores)
+            global_max = np.max(all_normal_scores)
+            
+            print(f"\n📊 NORMAL GÖRÜNTÜLER İÇİN GLOBAL İSTATİSTİKLER:")
+            print(f"   📈 Global Mean: {global_mean:.6f}")
+            print(f"   📏 Global Std: {global_std:.6f}")
+            print(f"   🔝 Global Max: {global_max:.6f}")
+            
+            # Threshold hesaplama yöntemleri
+            threshold_candidates = {
+                "mean_plus_3std": global_mean + 3 * global_std,
+                "mean_plus_2std": global_mean + 2 * global_std,
+                "global_p99": np.percentile(all_normal_scores, 99),
+                "global_p995": np.percentile(all_normal_scores, 99.5),
+                "global_p999": np.percentile(all_normal_scores, 99.9),
+                "max_p99": np.max([s["p99"] for s in normal_stats]),
+                "mean_of_maxes": np.mean([s["max"] for s in normal_stats]),
+            }
+            
+            print(f"\n🎯 THRESHOLD ADAYLARI:")
+            for method, value in threshold_candidates.items():
+                print(f"   {method}: {value:.6f}")
+            
+            # False positive rate hesapla her threshold için
+            best_threshold = None
+            best_method = None
+            best_fp_rate = float('inf')
+            
+            target_fp_rate = 0.05  # Maksimum %5 false positive
+            
+            for method, threshold in threshold_candidates.items():
+                # Her normal görüntü için false positive rate hesapla
+                fp_rates = []
+                for stats in normal_stats:
+                    # Bu görüntü için bu threshold ile kaç piksel anomali olarak işaretlenecek
+                    # Bunu tam olarak hesaplamak için görüntüyü tekrar işlememiz gerekir
+                    # Ama yaklaşık olarak p99 değeri ile tahmin edebiliriz
+                    if threshold > stats["p99"]:
+                        fp_rate = 0.01  # %1 false positive (p99'dan yüksek)
+                    elif threshold > stats["p95"]:
+                        fp_rate = 0.05  # %5 false positive 
+                    elif threshold > stats["mean"] + 2*stats["std"]:
+                        fp_rate = 0.025  # %2.5 false positive
+                    else:
+                        fp_rate = 0.1  # %10 false positive
+                    
+                    fp_rates.append(fp_rate)
+                
+                avg_fp_rate = np.mean(fp_rates)
+                
+                print(f"   {method}: FP Rate = {avg_fp_rate:.1%}")
+                
+                # En düşük false positive rate'e sahip olanı seç
+                if avg_fp_rate < best_fp_rate and avg_fp_rate <= target_fp_rate:
+                    best_fp_rate = avg_fp_rate
+                    best_threshold = threshold
+                    best_method = method
+            
+            # Eğer hiçbiri target'a uymuyorsa, en konservatif olanı seç
+            if best_threshold is None:
+                best_method = "global_p999"  # En konservatif
+                best_threshold = threshold_candidates[best_method]
+                best_fp_rate = 0.001  # %0.1 false positive
+            
+            print(f"\n🏆 EN İYİ THRESHOLD:")
+            print(f"   🎯 Yöntem: {best_method}")
+            print(f"   📏 Değer: {best_threshold:.6f}")
+            print(f"   📊 Beklenen FP Rate: {best_fp_rate:.1%}")
+            
+            return {
+                "success": True,
+                "calibrated_threshold": best_threshold,
+                "threshold_method": f"Calibrated-{best_method}",
+                "false_positive_rate": best_fp_rate,
+                "normal_image_count": len(selected_images),
+                "global_stats": {
+                    "mean": global_mean,
+                    "std": global_std,
+                    "max": global_max
+                },
+                "threshold_candidates": threshold_candidates,
+                "individual_stats": normal_stats
+            }
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": f"Kalibrasyon hatası: {str(e)}"
+            }
+
+    def detect_anomalies(self, image_path: str, model_type: str, dataset: str, 
+                        use_calibrated_threshold: bool = True) -> Dict:
+        """Anomali tespiti yap - Kalibre edilmiş threshold ile"""
+        print("\n" + "="*60)
+        print("🔍 ANOMALİ TESPİTİ (Kalibre Edilmiş Threshold)")
+        print("="*60)
+        
+        try:
+            # Önce threshold kalibrasyonu yap
+            if use_calibrated_threshold:
+                calibration_result = self.calibrate_threshold_on_normal_images(model_type, dataset, num_samples=10)
+                
+                if calibration_result["success"]:
+                    print(f"✅ Threshold kalibrasyonu başarılı!")
+                    print(f"🎯 Kalibre edilmiş threshold: {calibration_result['calibrated_threshold']:.6f}")
+                    print(f"📊 False positive rate: {calibration_result['false_positive_rate']:.1%}")
+                    calibrated_threshold = calibration_result['calibrated_threshold']
+                    threshold_method = calibration_result['threshold_method']
+                else:
+                    print(f"⚠️ Kalibrasyon başarısız: {calibration_result['error']}")
+                    print("📏 Fallback threshold kullanılıyor...")
+                    calibrated_threshold = None
+                    threshold_method = "Fallback-Percentile99"
+            else:
+                calibrated_threshold = None
+                threshold_method = "Individual-AUROC"
+            
+            # Custom anomaly calculation function
+            def calculate_raw_anomaly_map(fs_list, ft_list, out_size, norm):
+                """Normalizasyon olmadan anomali haritası hesapla"""
+                anomaly_map = 0
+                for i in range(len(ft_list)):
+                    fs = fs_list[i]
+                    ft = ft_list[i]
+                    fs_norm = F.normalize(fs, p=2) if norm else fs
+                    ft_norm = F.normalize(ft, p=2) if norm else ft
+
+                    a_map = 0.5 * (ft_norm - fs_norm) ** 2
+                    a_map = a_map.sum(1, keepdim=True)
+                    a_map = F.interpolate(a_map, size=out_size, mode="bilinear", align_corners=False)
+                    anomaly_map += a_map
+                
+                anomaly_map = anomaly_map.squeeze().cpu().numpy()
+                
+                # Gaussian filter uygula
+                from scipy.ndimage import gaussian_filter
+                if len(anomaly_map.shape) == 2:
+                    anomaly_map = gaussian_filter(anomaly_map, sigma=4)
+                else:
+                    for i in range(anomaly_map.shape[0]):
+                        anomaly_map[i] = gaussian_filter(anomaly_map[i], sigma=4)
                 return anomaly_map
             
             # Konfigürasyon hazırla
@@ -152,7 +398,7 @@ class AnomalyVisualizer:
             model_path = Path(f"results/models/{dataset}/{model_type}/student.pth")
             if not model_path.exists():
                 return {
-                    "success": False, 
+                    "success": False,
                     "error": f"Model ağırlıkları bulunamadı: {model_path}"
                 }
             
@@ -170,7 +416,7 @@ class AnomalyVisualizer:
                 trainer.infer(image_tensor)
                 trainer.post_process()
                 
-                # Raw anomaly map hesapla (normalizasyon yok)
+                # Raw anomaly map hesapla
                 anomaly_map = calculate_raw_anomaly_map(
                     trainer.features_s,
                     trainer.features_t,
@@ -183,106 +429,68 @@ class AnomalyVisualizer:
                 anomaly_map = anomaly_map[0]
             
             # İstatistikleri hesapla
-            max_anomaly = np.max(anomaly_map)
-            mean_anomaly = np.mean(anomaly_map)
-            std_anomaly = np.std(anomaly_map)
-            min_anomaly = np.min(anomaly_map)
+            flat_scores = anomaly_map.flatten()
+            max_anomaly = np.max(flat_scores)
+            mean_anomaly = np.mean(flat_scores)
+            std_anomaly = np.std(flat_scores)
+            min_anomaly = np.min(flat_scores)
             
-            # Percentile'ları hesapla
-            percentiles = np.percentile(anomaly_map, [50, 75, 90, 95, 99])
-            
-            print(f"📊 Gerçek Anomali İstatistikleri:")
+            print(f"\n📊 Bu görüntü için istatistikler:")
             print(f"   📏 Min/Max: [{min_anomaly:.6f}, {max_anomaly:.6f}]")
             print(f"   📈 Mean ± Std: {mean_anomaly:.6f} ± {std_anomaly:.6f}")
-            print(f"   📊 Percentiles [50,75,90,95,99]: {percentiles}")
             
-            # Dinamik threshold hesapla (istatistiksel yaklaşım)
-            # 1. Otsu threshold benzeri yaklaşım
-            flat_scores = anomaly_map.flatten().reshape(-1, 1)
-            
-            # K-means ile 2 cluster (normal vs anomali)
-            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(flat_scores)
-            cluster_centers = kmeans.cluster_centers_.flatten()
-            
-            # Yüksek cluster'ın merkezini threshold olarak kullan
-            otsu_threshold = np.max(cluster_centers)
-            
-            # Alternatif thresholdlar
-            percentile_95_threshold = np.percentile(anomaly_map, 95)
-            statistical_threshold = mean_anomaly + 2.5 * std_anomaly
-            
-            print(f"\n🧠 Dinamik Threshold Hesaplamaları:")
-            print(f"   🎯 K-means (Otsu benzeri): {otsu_threshold:.6f}")
-            print(f"   📊 Percentile 95%: {percentile_95_threshold:.6f}")
-            print(f"   📈 İstatistiksel (μ + 2.5σ): {statistical_threshold:.6f}")
-            
-            # En iyi threshold'u seç
-            candidate_thresholds = [otsu_threshold, percentile_95_threshold, statistical_threshold]
-            
-            # Her threshold için anomali oranını hesapla
-            threshold_results = {}
-            for i, thresh in enumerate(candidate_thresholds):
-                anomaly_count = np.sum(anomaly_map > thresh)
-                anomaly_ratio = anomaly_count / anomaly_map.size
-                threshold_results[i] = {
-                    "threshold": thresh,
-                    "anomaly_ratio": anomaly_ratio,
-                    "anomaly_count": anomaly_count
-                }
-                
-                method_names = ["K-means", "Percentile95", "Statistical"]
-                print(f"   {method_names[i]} → Anomali oranı: {anomaly_ratio:.4%} ({anomaly_count:,} piksel)")
-            
-            # Makul anomali oranına sahip threshold'u seç (0.1% - 10% arası)
-            best_threshold = statistical_threshold  # varsayılan
-            best_method = "Statistical"
-            
-            for i, result in threshold_results.items():
-                ratio = result["anomaly_ratio"]
-                if 0.001 <= ratio <= 0.1:  # %0.1 - %10 arası makul
-                    best_threshold = result["threshold"]
-                    best_method = ["K-means", "Percentile95", "Statistical"][i]
-                    break
+            # Threshold belirleme
+            if calibrated_threshold is not None:
+                # Kalibre edilmiş threshold kullan
+                best_threshold = calibrated_threshold
+                best_name = threshold_method
+                print(f"\n🎯 Kalibre edilmiş threshold kullanılıyor: {best_threshold:.6f}")
+            else:
+                # Fallback: Bu görüntü için percentile 99 kullan
+                best_threshold = np.percentile(flat_scores, 99)
+                best_name = threshold_method
+                print(f"\n📏 Fallback threshold (99% percentile): {best_threshold:.6f}")
             
             # Final hesaplamalar
-            final_anomaly_pixels = np.sum(anomaly_map > best_threshold)
-            final_anomaly_ratio = final_anomaly_pixels / anomaly_map.size
+            final_binary_mask = (anomaly_map > best_threshold).astype(np.uint8)
+            anomaly_count = np.sum(final_binary_mask)
+            anomaly_ratio = anomaly_count / len(flat_scores)
             
-            print(f"\n🎯 Final Threshold Seçimi:")
-            print(f"   ✅ Seçilen yöntem: {best_method}")
-            print(f"   🎯 Threshold: {best_threshold:.6f}")
-            print(f"   🔴 Anomali pikselleri: {final_anomaly_pixels:,}/{anomaly_map.size:,}")
-            print(f"   📊 Anomali oranı: {final_anomaly_ratio:.4%}")
+            # Bölge analizi
+            num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(final_binary_mask)
+            num_regions = num_labels - 1  # Background hariç
+            largest_area = 0
+            if num_regions > 0:
+                areas = stats[1:, cv2.CC_STAT_AREA]
+                largest_area = np.max(areas)
             
-            # Anomali var mı?
-            has_anomaly = final_anomaly_ratio > 0.001  # En az %0.1
+            has_anomaly = anomaly_ratio > 0.0005 and num_regions > 0  # Çok düşük threshold: %0.05
             
+            # Anomali derecesi belirleme (çok daha konservatif)
+            if anomaly_ratio < 0.0005:  # %0.05'ten az
+                severity = "NORMAL"
+                severity_emoji = "✅"
+            elif anomaly_ratio < 0.002:  # %0.2'den az
+                severity = "DÜŞÜK RİSK"
+                severity_emoji = "⚠️"
+            elif anomaly_ratio < 0.01:   # %1'den az
+                severity = "ORTA RİSK"
+                severity_emoji = "🟠"
+            else:
+                severity = "YÜKSEK RİSK"
+                severity_emoji = "🚨"
+            
+            print(f"\n📊 SONUÇ ANALİZİ:")
+            print(f"   🎯 Kullanılan threshold: {best_threshold:.6f}")
+            print(f"   🔴 Anomali oranı: {anomaly_ratio:.4%}")
+            print(f"   🏷️ Bölge sayısı: {num_regions}")
+            print(f"   📐 En büyük bölge: {largest_area} piksel")
+            
+            print(f"\n🚨 SONUÇ: {severity_emoji} {severity}")
             if has_anomaly:
                 print("🔴 ANOMALİ TESPİT EDİLDİ!")
             else:
                 print("🟢 Anomali tespit edilmedi")
-            
-            # Anomali bölgelerini analiz et
-            binary_mask = (anomaly_map > best_threshold).astype(np.uint8)
-            
-            # Connected components analizi
-            import cv2
-            num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(binary_mask)
-            
-            print(f"\n🔍 Anomali Bölge Analizi:")
-            print(f"   🏷️  Tespit edilen bölge sayısı: {num_labels - 1}")  # -1 çünkü background dahil
-            
-            if num_labels > 1:
-                # En büyük bölgeleri listele
-                areas = stats[1:, cv2.CC_STAT_AREA]  # Background hariç
-                largest_areas = np.argsort(areas)[::-1][:3]  # En büyük 3 bölge
-                
-                for i, area_idx in enumerate(largest_areas):
-                    actual_idx = area_idx + 1  # Background offset
-                    area = stats[actual_idx, cv2.CC_STAT_AREA]
-                    x, y = int(centroids[actual_idx][0]), int(centroids[actual_idx][1])
-                    print(f"   {i+1}. Bölge: {area} piksel, merkez: ({x}, {y})")
             
             return {
                 "success": True,
@@ -292,22 +500,20 @@ class AnomalyVisualizer:
                 "std_score": float(std_anomaly),
                 "min_score": float(min_anomaly),
                 "threshold": best_threshold,
-                "threshold_method": best_method,
-                "anomaly_ratio": float(final_anomaly_ratio),
-                "anomaly_count": int(final_anomaly_pixels),
-                "percentiles": percentiles.tolist(),
+                "threshold_method": best_name,
+                "anomaly_ratio": float(anomaly_ratio),
+                "anomaly_count": int(anomaly_count),
+                "num_regions": int(num_regions),
+                "largest_area": int(largest_area),
+                "severity": severity,
+                "severity_emoji": severity_emoji,
                 "anomaly_map": anomaly_map,
-                "binary_mask": binary_mask,
+                "binary_mask": final_binary_mask,
                 "original_image": original_image,
                 "model_type": model_type,
                 "dataset": dataset,
                 "image_path": image_path,
-                "num_regions": int(num_labels - 1),
-                "threshold_candidates": {
-                    "kmeans": float(otsu_threshold),
-                    "percentile95": float(percentile_95_threshold),
-                    "statistical": float(statistical_threshold)
-                }
+                "calibration_result": calibration_result if use_calibrated_threshold else None
             }
             
         except Exception as e:
@@ -434,9 +640,9 @@ class AnomalyVisualizer:
             "captures_outliers": adaptive_thresh > np.percentile(scores, 90),  # En üst %10'u yakalasın
             "better_than_original": adaptive_ratio > 0 and abs(adaptive_ratio - original_ratio) > 0.001,
             "statistical_significance": adaptive_thresh > np.mean(scores) + 2 * np.std(scores)  # İstatistiksel anlamlılık
-        }
+        };
         
-        quality_score = sum(criteria.values())
+        quality_score = sum(criteria.values());
         is_better = quality_score >= 3  # 5'ten en az 3'ü sağlanmalı
         
         print(f"\n🔍 Threshold Kalite Değerlendirmesi:")
@@ -673,6 +879,14 @@ class AnomalyVisualizer:
         anomaly_map = result["anomaly_map"]
         original_image = result["original_image"]
         threshold = result["threshold"]
+
+        # --- Ensure percentile values are available ---
+        if "percentiles" in result and result["percentiles"] is not None:
+            percentiles = result["percentiles"]
+        else:
+            # Calculate on the fly
+            percentiles = [np.percentile(anomaly_map, p) for p in [50, 75, 90, 95, 99]]
+            result["percentiles"] = percentiles
         
         # Figure oluştur - büyük boyut
         fig = plt.figure(figsize=(20, 12))
@@ -758,11 +972,11 @@ class AnomalyVisualizer:
 • Threshold: {result["threshold"]:.3f}
 
 📊 PERCENTİLES:
-• 50%: {result["percentiles"][0]:.6f}
-• 75%: {result["percentiles"][1]:.6f}
-• 90%: {result["percentiles"][2]:.6f}
-• 95%: {result["percentiles"][3]:.6f}
-• 99%: {result["percentiles"][4]:.6f}
+• 50%: {percentiles[0]:.6f}
+• 75%: {percentiles[1]:.6f}
+• 90%: {percentiles[2]:.6f}
+• 95%: {percentiles[3]:.6f}
+• 99%: {percentiles[4]:.6f}
 
 🎯 SONUÇ:
 • Anomali Var: {'✅ EVET' if result["has_anomaly"] else '❌ HAYIR'}

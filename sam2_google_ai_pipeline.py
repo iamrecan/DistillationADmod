@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 # Custom imports
 from llm_image_analysis import GoogleAIImageAnalyzer, create_analysis_report
+from analysis_config import AnalysisConfig
 
 # .env dosyasından çevre değişkenlerini yükle
 load_dotenv()
@@ -26,7 +27,7 @@ class SAM2GoogleAIPipeline:
     def __init__(self):
         """Initialize the pipeline"""
         self.analyzer = GoogleAIImageAnalyzer()
-        self.temp_dir = "temp_analysis"
+        self.temp_dir = AnalysisConfig.get_temp_analysis_path("")
         self.ensure_temp_dir()
     
     def ensure_temp_dir(self):
@@ -188,7 +189,7 @@ class SAM2GoogleAIPipeline:
         
         # Çıktı dizinlerini hazırla
         timestamp = int(time.time())
-        sam2_output_dir = f"{self.temp_dir}/sam2_output_{timestamp}"
+        sam2_output_dir = AnalysisConfig.get_sam2_output_dir(timestamp)
         
         pipeline_results = {
             "timestamp": timestamp,
@@ -228,7 +229,7 @@ class SAM2GoogleAIPipeline:
                 pipeline_results["error"] = f"AI analizi başarısız: {ai_result.get('error')}"
             
             # 5. Rapor oluştur
-            report_path = f"{output_prefix}_report_{timestamp}.json"
+            report_path = AnalysisConfig.get_sam2_report_path(timestamp)
             self.create_pipeline_report(pipeline_results, report_path)
             pipeline_results["report_path"] = report_path
             

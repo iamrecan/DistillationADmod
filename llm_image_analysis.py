@@ -16,6 +16,9 @@ import time
 from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
+# Analysis configuration import
+from analysis_config import AnalysisConfig
+
 # .env dosyasından çevre değişkenlerini yükle
 load_dotenv()
 
@@ -300,12 +303,16 @@ Karşılaştırmalı analiz yapın:
         except Exception as e:
             return {"error": f"Karşılaştırmalı analiz hatası: {str(e)}"}
 
-def create_analysis_report(analysis_results: Dict, output_path: str = "analysis_report.json"):
+def create_analysis_report(analysis_results: Dict, output_path: str = None):
     """Analiz sonuçlarından rapor oluşturur"""
     
     if not analysis_results.get("success"):
         print(f"Analiz başarısız: {analysis_results.get('error', 'Bilinmeyen hata')}")
         return
+    
+    # Eğer output_path belirtilmemişse, otomatik oluştur
+    if output_path is None:
+        output_path = AnalysisConfig.get_llm_report_path()
     
     # Rapor oluştur
     report = {

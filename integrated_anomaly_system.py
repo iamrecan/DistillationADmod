@@ -2,11 +2,12 @@
 """
 🎯 TAM ENTEGRASİON PİPELİNE'I:
 Anomali Tespit → SAM2 Segmentasyon → LLM Analizi → Kullanıcı Onayı
+Import problemleri çözülmüş versiyon
 """
 
 import torch
+import torch.nn.functional as F
 import time
-import yaml
 import numpy as np
 import json
 import cv2
@@ -14,17 +15,77 @@ import os
 import sys
 from pathlib import Path
 from PIL import Image
-import matplotlib.pyplot as plt
 import torchvision.transforms as transforms
 from typing import Dict, List, Optional, Tuple
 
-# Kendi modüllerimizi import et
-from models.SingleNet.trainer_sn import SnTrainer
-from models.DBFAD.trainer_dbfad import DbfadTrainer
-from models.EfficientAD.trainer_ead import EadTrainer
-from models.ReverseDistillation.trainer_rd import RdTrainer
-from models.StudentTeacher.trainer_st import StTrainer
-from sam2_google_ai_pipeline import SAM2GoogleAIPipeline
+# Analysis configuration import
+from analysis_config import AnalysisConfig, initialize_analysis_config
+
+# Gaussian filter için scipy import'u ekle
+try:
+    from scipy.ndimage import gaussian_filter
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    print("⚠️ Scipy modülü bulunamadı - Gaussian filter kullanılamayacak")
+
+# Zorunlu olmayan modülleri try-except ile import et
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+    print("⚠️ YAML modülü bulunamadı")
+
+try:
+    import matplotlib.pyplot as plt
+    PLT_AVAILABLE = True
+except ImportError:
+    PLT_AVAILABLE = False
+    print("⚠️ Matplotlib modülü bulunamadı")
+
+# Kendi modüllerimizi güvenli import et
+try:
+    from models.SingleNet.trainer_sn import SnTrainer
+    SN_AVAILABLE = True
+except ImportError as e:
+    SN_AVAILABLE = False
+    print(f"⚠️ SnTrainer import hatası: {e}")
+
+try:
+    from models.DBFAD.trainer_dbfad import DbfadTrainer
+    DBFAD_AVAILABLE = True
+except ImportError as e:
+    DBFAD_AVAILABLE = False
+    print(f"⚠️ DbfadTrainer import hatası: {e}")
+
+try:
+    from models.EfficientAD.trainer_ead import EadTrainer
+    EAD_AVAILABLE = True
+except ImportError as e:
+    EAD_AVAILABLE = False
+    print(f"⚠️ EadTrainer import hatası: {e}")
+
+try:
+    from models.ReverseDistillation.trainer_rd import RdTrainer
+    RD_AVAILABLE = True
+except ImportError as e:
+    RD_AVAILABLE = False
+    print(f"⚠️ RdTrainer import hatası: {e}")
+
+try:
+    from models.StudentTeacher.trainer_st import StTrainer
+    ST_AVAILABLE = True
+except ImportError as e:
+    ST_AVAILABLE = False
+    print(f"⚠️ StTrainer import hatası: {e}")
+
+try:
+    from sam2_google_ai_pipeline import SAM2GoogleAIPipeline
+    SAM2_AVAILABLE = True
+except ImportError as e:
+    SAM2_AVAILABLE = False
+    print(f"⚠️ SAM2GoogleAIPipeline import hatası: {e}")
 
 
 class IntegratedAnomalySystem:
@@ -32,9 +93,34 @@ class IntegratedAnomalySystem:
     
     def __init__(self):
         """Sistemi başlat"""
+        # Initialize analysis configuration
+        initialize_analysis_config()
+        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.sam2_pipeline = SAM2GoogleAIPipeline()
-        self.supported_models = ["sn", "dbfad", "ead", "rd", "st"]
+        
+        # SAM2 pipeline'ını güvenli başlat
+        if SAM2_AVAILABLE:
+            try:
+                self.sam2_pipeline = SAM2GoogleAIPipeline()
+                print("✅ SAM2 pipeline başlatıldı")
+            except Exception as e:
+                self.sam2_pipeline = None
+                print(f"⚠️ SAM2 pipeline başlatılamadı: {e}")
+        else:
+            self.sam2_pipeline = None
+            
+        self.supported_models = []
+        if SN_AVAILABLE:
+            self.supported_models.append("sn")
+        if DBFAD_AVAILABLE:
+            self.supported_models.append("dbfad")
+        if EAD_AVAILABLE:
+            self.supported_models.append("ead")
+        if RD_AVAILABLE:
+            self.supported_models.append("rd")
+        if ST_AVAILABLE:
+            self.supported_models.append("st")
+            
         self.threshold = 0.291  # Varsayılan threshold
         
         # 🧠 Adaptif threshold parametreleri (normalized anomaly score için)
@@ -52,23 +138,24 @@ class IntegratedAnomalySystem:
         if self.device.type == "cuda":
             print(f"   GPU: {torch.cuda.get_device_name(0)}")
         print(f"🧠 Adaptif threshold sistemi: {'✅ Aktif' if self.adaptive_threshold_config['use_adaptive'] else '❌ Pasif'}")
+        print(f"🤖 Desteklenen modeller: {self.supported_models}")
     
     def load_anomaly_model(self, model_type: str, config: Dict) -> object:
         """Anomali tespit modelini yükle"""
         print(f"📋 {model_type.upper()} modeli yükleniyor...")
         
-        if model_type == "sn":
+        if model_type == "sn" and SN_AVAILABLE:
             return SnTrainer(config, self.device)
-        elif model_type == "dbfad":
+        elif model_type == "dbfad" and DBFAD_AVAILABLE:
             return DbfadTrainer(config, self.device)
-        elif model_type == "ead":
+        elif model_type == "ead" and EAD_AVAILABLE:
             return EadTrainer(config, self.device)
-        elif model_type == "rd":
+        elif model_type == "rd" and RD_AVAILABLE:
             return RdTrainer(config, self.device)
-        elif model_type == "st":
+        elif model_type == "st" and ST_AVAILABLE:
             return StTrainer(config, self.device)
         else:
-            raise ValueError(f"Desteklenmeyen model türü: {model_type}")
+            raise ValueError(f"Desteklenmeyen veya yüklenemeyen model türü: {model_type}")
     
     def preprocess_image(self, image_path: str, img_size: int = 224) -> torch.Tensor:
         """Görüntüyü inference için hazırla"""
@@ -102,15 +189,256 @@ class IntegratedAnomalySystem:
 
         return available_models
     
+    def calculate_raw_anomaly_map(self, fs_list, ft_list, out_size, norm):
+        """🔥 ANOMALİ HARİTASI HESAPLAMA - anomaly_visualizer.py'den kopyalandı"""
+        anomaly_map = 0
+        for i in range(len(ft_list)):
+            fs = fs_list[i]
+            ft = ft_list[i]
+            fs_norm = F.normalize(fs, p=2) if norm else fs
+            ft_norm = F.normalize(ft, p=2) if norm else ft
+
+            a_map = 0.5 * (ft_norm - fs_norm) ** 2
+            a_map = a_map.sum(1, keepdim=True)
+            a_map = F.interpolate(a_map, size=out_size, mode="bilinear", align_corners=False)
+            anomaly_map += a_map
+        
+        anomaly_map = anomaly_map.squeeze().cpu().numpy()
+        
+        # ✨ Gaussian filter uygula (scipy varsa)
+        if SCIPY_AVAILABLE:
+            if len(anomaly_map.shape) == 2:
+                anomaly_map = gaussian_filter(anomaly_map, sigma=4)
+            else:
+                for i in range(anomaly_map.shape[0]):
+                    anomaly_map[i] = gaussian_filter(anomaly_map[i], sigma=4)
+        else:
+            print("⚠️ Scipy yok, Gaussian filter atlanıyor")
+
+        return anomaly_map
+
+    def calibrate_threshold_on_normal_images(self, model_type: str, dataset: str, num_samples: int = 10) -> Dict:
+        """🎯 THRESHOLD KALİBRASYONU - anomaly_visualizer.py'den geliştirilmiş versiyon"""
+        print(f"\n🎯 THRESHOLD KALİBRASYONU")
+        print(f"📊 Dataset: {dataset}")
+        print(f"🤖 Model: {model_type}")
+        print(f"📁 Örneklem: {num_samples} normal görüntü")
+        print("-" * 50)
+        
+        try:
+            import random
+            
+            # Normal görüntü dizinini kontrol et
+            normal_dir = Path(f"dataset/{dataset}/test/good")
+            if not normal_dir.exists():
+                return {
+                    "success": False,
+                    "error": f"Normal görüntü dizini bulunamadı: {normal_dir}"
+                }
+            
+            # Normal görüntüleri listele
+            normal_images = list(normal_dir.glob("*.png")) + list(normal_dir.glob("*.jpg"))
+            if len(normal_images) == 0:
+                return {
+                    "success": False,
+                    "error": f"Normal görüntü bulunamadı: {normal_dir}"
+                }
+            
+            # Örneklem seç
+            selected_images = random.sample(normal_images, min(num_samples, len(normal_images)))
+            print(f"✅ {len(selected_images)} normal görüntü seçildi")
+            
+            # Model yükle
+            config = {
+                "data_path": f"./dataset",
+                "obj": dataset,
+                "save_path": "./results",
+                "distillType": model_type,
+                "inference_only_mode": True,
+                "TrainingData": {
+                    "epochs": 100,
+                    "batch_size": 32,
+                    "lr": 0.0004,
+                    "img_size": 224,
+                    "crop_size": 224,
+                    "norm": True
+                }
+            }
+            
+            trainer = self.load_anomaly_model(model_type, config)
+            trainer.model_dir = f"./results/models/{dataset}/{model_type}"
+            
+            model_path = Path(f"results/models/{dataset}/{model_type}/student.pth")
+            if not model_path.exists():
+                return {
+                    "success": False,
+                    "error": f"Model ağırlıkları bulunamadı: {model_path}"
+                }
+            
+            trainer.load_weights()
+            trainer.change_mode("eval")
+            
+            # Normal görüntüler üzerinde analiz
+            all_normal_scores = []
+            normal_stats = []
+            
+            print("🔍 Normal görüntüler analiz ediliyor...")
+            
+            for i, img_path in enumerate(selected_images):
+                print(f"   📸 {i+1}/{len(selected_images)}: {img_path.name}")
+                
+                # Görüntüyü işle
+                image_tensor = self.preprocess_image(str(img_path))
+                
+                # Inference
+                with torch.no_grad():
+                    trainer.infer(image_tensor)
+                    trainer.post_process()
+                    
+                    # 🔥 Raw anomaly map hesapla (düzeltilmiş versiyon)
+                    anomaly_map = self.calculate_raw_anomaly_map(
+                        trainer.features_s,
+                        trainer.features_t,
+                        out_size=224,
+                        norm=trainer.norm
+                    )
+                
+                if len(anomaly_map.shape) == 3:
+                    anomaly_map = anomaly_map[0]
+                
+                # İstatistikleri topla
+                flat_scores = anomaly_map.flatten()
+                all_normal_scores.extend(flat_scores)
+                
+                stats = {
+                    "image": img_path.name,
+                    "mean": np.mean(flat_scores),
+                    "std": np.std(flat_scores),
+                    "max": np.max(flat_scores),
+                    "min": np.min(flat_scores),
+                    "p95": np.percentile(flat_scores, 95),
+                    "p99": np.percentile(flat_scores, 99)
+                }
+                normal_stats.append(stats)
+                
+                print(f"      📊 Mean: {stats['mean']:.6f}, Max: {stats['max']:.6f}, P99: {stats['p99']:.6f}")
+            
+            # Genel istatistikler
+            all_normal_scores = np.array(all_normal_scores)
+            global_mean = np.mean(all_normal_scores)
+            global_std = np.std(all_normal_scores)
+            global_max = np.max(all_normal_scores)
+            
+            print(f"\n📊 NORMAL GÖRÜNTÜLER İÇİN GLOBAL İSTATİSTİKLER:")
+            print(f"   📈 Global Mean: {global_mean:.6f}")
+            print(f"   📏 Global Std: {global_std:.6f}")
+            print(f"   🔝 Global Max: {global_max:.6f}")
+            
+            # 🎯 THRESHOLD HESAPLAMA YÖNTEMLERİ (anomaly_visualizer.py'den)
+            threshold_candidates = {
+                "mean_plus_3std": global_mean + 3 * global_std,
+                "mean_plus_2std": global_mean + 2 * global_std,
+                "global_p99": np.percentile(all_normal_scores, 99),
+                "global_p995": np.percentile(all_normal_scores, 99.5),
+                "global_p999": np.percentile(all_normal_scores, 99.9),
+                "max_p99": np.max([s["p99"] for s in normal_stats]),
+                "mean_of_maxes": np.mean([s["max"] for s in normal_stats]),
+            }
+            
+            print(f"\n🎯 THRESHOLD ADAYLARI:")
+            for method, value in threshold_candidates.items():
+                print(f"   {method}: {value:.6f}")
+            
+            # 📊 FALSE POSITIVE RATE HESAPLA (anomaly_visualizer.py'den)
+            best_threshold = None
+            best_method = None
+            best_fp_rate = float('inf')
+            
+            target_fp_rate = 0.05  # Maksimum %5 false positive
+            
+            for method, threshold in threshold_candidates.items():
+                # Her normal görüntü için false positive rate hesapla
+                fp_rates = []
+                for stats in normal_stats:
+                    # Bu görüntü için bu threshold ile kaç piksel anomali olarak işaretlenecek
+                    # Bunu tam olarak hesaplamak için görüntüyü tekrar işlememiz gerekir
+                    # Ama yaklaşık olarak p99 değeri ile tahmin edebiliriz
+                    if threshold > stats["p99"]:
+                        fp_rate = 0.01  # %1 false positive (p99'dan yüksek)
+                    elif threshold > stats["p95"]:
+                        fp_rate = 0.05  # %5 false positive 
+                    elif threshold > stats["mean"] + 2*stats["std"]:
+                        fp_rate = 0.025  # %2.5 false positive
+                    else:
+                        fp_rate = 0.1  # %10 false positive
+                    
+                    fp_rates.append(fp_rate)
+                
+                avg_fp_rate = np.mean(fp_rates)
+                
+                print(f"   {method}: FP Rate = {avg_fp_rate:.1%}")
+                
+                # En düşük false positive rate'e sahip olanı seç
+                if avg_fp_rate < best_fp_rate and avg_fp_rate <= target_fp_rate:
+                    best_fp_rate = avg_fp_rate
+                    best_threshold = threshold
+                    best_method = method
+            
+            # Eğer hiçbiri target'a uymuyorsa, en konservatif olanı seç
+            if best_threshold is None:
+                best_method = "global_p999"  # En konservatif
+                best_threshold = threshold_candidates[best_method]
+                best_fp_rate = 0.001  # %0.1 false positive
+            
+            print(f"\n🏆 EN İYİ THRESHOLD:")
+            print(f"   🎯 Yöntem: {best_method}")
+            print(f"   📏 Değer: {best_threshold:.6f}")
+            print(f"   📊 Beklenen FP Rate: {best_fp_rate:.1%}")
+            
+            return {
+                "success": True,
+                "calibrated_threshold": best_threshold,
+                "threshold_method": f"Calibrated-{best_method}",
+                "false_positive_rate": best_fp_rate,
+                "normal_image_count": len(selected_images),
+                "global_stats": {
+                    "mean": global_mean,
+                    "std": global_std,
+                    "max": global_max
+                },
+                "threshold_candidates": threshold_candidates,
+                "individual_stats": normal_stats
+            }
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": f"Kalibrasyon hatası: {str(e)}"
+            }
+
     def detect_anomalies(self, image_path: str, model_type: str, dataset: str) -> Dict:
-        """1️⃣ ADIM: Anomali tespiti yap - Normalized Anomaly Score ile"""
+        """1️⃣ ADIM: Anomali tespiti yap - Geliştirilmiş Threshold ile"""
         print("\n" + "="*60)
-        print("🔍 ADIM 1: ANOMALİ TESPİTİ (Normalized Anomaly Score)")
+        print("🔍 ADIM 1: ANOMALİ TESPİTİ (Geliştirilmiş Threshold)")
         print("="*60)
         
         try:
-            # Import the anomaly calculation function
-            from utils.functions import cal_anomaly_maps
+            # Önce threshold kalibrasyonu yap
+            calibration_result = self.calibrate_threshold_on_normal_images(model_type, dataset, num_samples=10)
+            
+            if calibration_result["success"]:
+                print(f"✅ Threshold kalibrasyonu başarılı!")
+                print(f"🎯 Kalibre edilmiş threshold: {calibration_result['calibrated_threshold']:.6f}")
+                print(f"📊 False positive rate: {calibration_result['false_positive_rate']:.1%}")
+                calibrated_threshold = calibration_result['calibrated_threshold']
+                threshold_method = calibration_result['threshold_method']
+            else:
+                print(f"⚠️ Kalibrasyon başarısız: {calibration_result['error']}")
+                print("📏 Fallback threshold kullanılıyor...")
+                calibrated_threshold = None
+                threshold_method = "Fallback-Percentile99"
             
             # Konfigürasyon hazırla - model_dir yolu düzeltildi
             config = {
@@ -156,12 +484,11 @@ class IntegratedAnomalySystem:
                 trainer.infer(image_tensor)
                 trainer.post_process()  # This processes the features
                 
-                # Now calculate the actual anomaly map using the processed features
-                # Make sure we pass the features correctly (not as lists)
-                anomaly_map = cal_anomaly_maps(
-                    trainer.features_s,  # Remove the list wrapper
-                    trainer.features_t,  # Remove the list wrapper
-                    out_size=224,  # Same as crop_size
+                # 🔥 Raw anomaly map hesapla (düzeltilmiş versiyon)
+                anomaly_map = self.calculate_raw_anomaly_map(
+                    trainer.features_s,
+                    trainer.features_t,
+                    out_size=224,
                     norm=trainer.norm
                 )
             
@@ -169,74 +496,69 @@ class IntegratedAnomalySystem:
             if len(anomaly_map.shape) == 3:
                 anomaly_map = anomaly_map[0]  # Remove batch dimension
             
-            # 📊 Temel anomali skorlarını hesapla
-            max_anomaly = np.max(anomaly_map)
-            mean_anomaly = np.mean(anomaly_map)
-            std_anomaly = np.std(anomaly_map)
+            # İstatistikleri hesapla
+            flat_scores = anomaly_map.flatten()
+            max_anomaly = np.max(flat_scores)
+            mean_anomaly = np.mean(flat_scores)
+            std_anomaly = np.std(flat_scores)
+            min_anomaly = np.min(flat_scores)
             
-            print(f"📊 Temel Anomali İstatistikleri:")
-            print(f"   📏 Min/Max: [{np.min(anomaly_map):.6f}, {max_anomaly:.6f}]")
+            print(f"\n📊 Bu görüntü için istatistikler:")
+            print(f"   📏 Min/Max: [{min_anomaly:.6f}, {max_anomaly:.6f}]")
             print(f"   📈 Mean ± Std: {mean_anomaly:.6f} ± {std_anomaly:.6f}")
-            print(f"   📊 Orijinal Threshold: {self.threshold:.6f}")
             
-            # 🧠 Adaptif threshold hesapla (eğer aktifse)
-            adaptive_results = {}
-            final_threshold = self.threshold
-            threshold_method = "Orijinal (Sabit)"
+            # Threshold belirleme
+            if calibrated_threshold is not None:
+                # Kalibre edilmiş threshold kullan
+                best_threshold = calibrated_threshold
+                best_name = threshold_method
+                print(f"\n🎯 Kalibre edilmiş threshold kullanılıyor: {best_threshold:.6f}")
+            else:
+                # Fallback: Bu görüntü için percentile 99 kullan
+                best_threshold = np.percentile(flat_scores, 99)
+                best_name = threshold_method
+                print(f"\n📏 Fallback threshold (99% percentile): {best_threshold:.6f}")
             
-            if self.adaptive_threshold_config["use_adaptive"]:
-                adaptive_results = self.calculate_adaptive_threshold(anomaly_map)
-                
-                # Adaptif threshold daha iyi mi kontrol et
-                if adaptive_results["is_adaptive_better"]:
-                    final_threshold = adaptive_results["adaptive_threshold"]
-                    threshold_method = "Adaptif (Normalized)"
-                    print(f"🧠 Adaptif threshold kullanılacak: {final_threshold:.6f}")
-                else:
-                    print(f"⚠️  Adaptif threshold kaliteli değil, orijinal threshold kullanılıyor: {self.threshold:.6f}")
+            # Final hesaplamalar
+            final_binary_mask = (anomaly_map > best_threshold).astype(np.uint8)
+            anomaly_count = np.sum(final_binary_mask)
+            anomaly_ratio = anomaly_count / len(flat_scores)
             
-            # Final anomali hesaplamaları
-            anomaly_pixels = np.sum(anomaly_map > final_threshold)
-            total_pixels = anomaly_map.size
-            anomaly_ratio = anomaly_pixels / total_pixels
+            # Bölge analizi
+            num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(final_binary_mask)
+            num_regions = num_labels - 1  # Background hariç
+            largest_area = 0
+            if num_regions > 0:
+                areas = stats[1:, cv2.CC_STAT_AREA]
+                largest_area = np.max(areas)
             
-            print(f"\n🎯 Final Anomali Analizi ({threshold_method}):")
-            print(f"   🔴 Threshold: {final_threshold:.6f}")
-            print(f"   📊 Anomali pikselleri: {anomaly_pixels:,}/{total_pixels:,} ({anomaly_ratio:.4%})")
+            has_anomaly = anomaly_ratio > 0.0005 and num_regions > 0  # Çok düşük threshold: %0.05
             
-            # 🔍 Normalized Anomaly Score hesapla
-            normalized_scores = None
-            if adaptive_results and "normalized_scores" in adaptive_results:
-                normalized_scores = adaptive_results["normalized_scores"]
-                normalized_threshold = adaptive_results["normalized_threshold"]
-                
-                # Normalized skorlarda anomali oranı
-                normalized_anomaly_count = np.sum(normalized_scores > normalized_threshold)
-                normalized_anomaly_ratio = normalized_anomaly_count / len(normalized_scores)
-                
-                print(f"🧠 Normalized Anomaly Score Analizi:")
-                print(f"   📈 Z-score threshold: {normalized_threshold:.3f}")
-                print(f"   🔴 Normalized anomali oranı: {normalized_anomaly_ratio:.4%}")
-            
-            # Anomali var mı? (Daha hassas kriter)
-            has_anomaly = (
-                max_anomaly > final_threshold and 
-                anomaly_ratio > self.adaptive_threshold_config["min_anomaly_ratio"]
-            )
-            
-            # Anomali seviyesi belirleme
-            if anomaly_ratio < 0.001:
+            # 🎯 ANOMALİ DERECESİ BELİRLEME (anomaly_visualizer.py'den)
+            if anomaly_ratio < 0.0005:  # %0.05'ten az
                 severity = "NORMAL"
                 severity_emoji = "✅"
-            elif anomaly_ratio < 0.01:
+            elif anomaly_ratio < 0.002:  # %0.2'den az
                 severity = "DÜŞÜK RİSK"
                 severity_emoji = "⚠️"
-            elif anomaly_ratio < 0.05:
+            elif anomaly_ratio < 0.01:   # %1'den az
                 severity = "ORTA RİSK"
                 severity_emoji = "🟠"
             else:
                 severity = "YÜKSEK RİSK"
                 severity_emoji = "🚨"
+            
+            print(f"\n📊 SONUÇ ANALİZİ:")
+            print(f"   🎯 Kullanılan threshold: {best_threshold:.6f}")
+            print(f"   🔴 Anomali oranı: {anomaly_ratio:.4%}")
+            print(f"   🏷️ Bölge sayısı: {num_regions}")
+            print(f"   📐 En büyük bölge: {largest_area} piksel")
+            
+            print(f"\n🚨 SONUÇ: {severity_emoji} {severity}")
+            if has_anomaly:
+                print("🔴 ANOMALİ TESPİT EDİLDİ!")
+            else:
+                print("🟢 Anomali tespit edilmedi")
             
             result = {
                 "success": True,
@@ -244,22 +566,20 @@ class IntegratedAnomalySystem:
                 "max_score": float(max_anomaly),
                 "mean_score": float(mean_anomaly),
                 "std_score": float(std_anomaly),
-                "threshold": final_threshold,
-                "threshold_method": threshold_method,
+                "min_score": float(min_anomaly),
+                "threshold": best_threshold,
+                "threshold_method": best_name,
                 "anomaly_ratio": float(anomaly_ratio),
+                "anomaly_count": int(anomaly_count),
+                "num_regions": int(num_regions),
+                "largest_area": int(largest_area),
                 "anomaly_map": anomaly_map,
                 "model_type": model_type,
                 "dataset": dataset,
                 "severity": severity,
                 "severity_emoji": severity_emoji,
-                "adaptive_results": adaptive_results if self.adaptive_threshold_config["use_adaptive"] else None,
-                "normalized_scores": normalized_scores.tolist() if normalized_scores is not None else None
+                "calibration_result": calibration_result
             }
-            
-            if has_anomaly:
-                print(f"🔴 ANOMALİ TESPİT EDİLDİ! {severity_emoji} {severity}")
-            else:
-                print(f"🟢 Anomali tespit edilmedi - {severity}")
             
             return result
             
@@ -267,7 +587,7 @@ class IntegratedAnomalySystem:
             import traceback
             traceback.print_exc()  # Print full error trace for debugging
             return {"success": False, "error": f"Anomali tespit hatası: {str(e)}"}
-    
+
     def calculate_adaptive_threshold(self, anomaly_map: np.ndarray) -> Dict:
         """🧠 Adaptif threshold hesapla - normalized anomaly score mantığı"""
         print("\n🧮 Adaptif Threshold Hesaplaması (Normalized Anomaly Score)")
@@ -501,7 +821,11 @@ class IntegratedAnomalySystem:
         plt.tight_layout()
         
         if not save_path:
-            save_path = f"results/anomaly_detection_{int(time.time())}.png"
+            save_path = AnalysisConfig.get_anomaly_visualization_path(
+                model="anomaly_detection", 
+                dataset="general", 
+                timestamp=int(time.time())
+            )
         
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path)
@@ -527,7 +851,7 @@ class IntegratedAnomalySystem:
             sam2_result = self.sam2_pipeline.run_sam2_segmentation(
                 image_path=image_path,
                 prompts=sam2_prompts,
-                output_dir=f"temp_analysis/sam2_output_{int(time.time())}"
+                output_dir=AnalysisConfig.get_sam2_output_dir()
             )
             
             if sam2_result["success"]:
@@ -537,7 +861,7 @@ class IntegratedAnomalySystem:
                 output_images = self.sam2_pipeline.find_output_images(sam2_result["output_dir"])
                 sam2_result["output_images"] = output_images
                 
-                print(f"📁 Çıktı dosyaları:")
+                print(f"📁 Çıktı dosya sayısı:")
                 for img_type, img_path in output_images.items():
                     print(f"   {img_type}: {img_path}")
             else:
@@ -703,7 +1027,7 @@ class IntegratedAnomalySystem:
                 return pipeline_results
             
             # 4️⃣ RAPOR OLUŞTURMA
-            report_path = f"integrated_analysis_report_{pipeline_results['timestamp']}.json"
+            report_path = AnalysisConfig.get_integrated_report_path(pipeline_results['timestamp'])
             self.create_integrated_report(pipeline_results, report_path)
             pipeline_results["report_path"] = report_path
             
@@ -764,6 +1088,40 @@ class IntegratedAnomalySystem:
             print("🔧 JSON serialization işlemi başlatılıyor...")
             serializable_steps = make_serializable(results.get("steps", {}))
             
+            # Pipeline özetini oluştur
+            steps = results.get("steps", {})
+            
+            # Anomali tespit sonuçları
+            anomaly_detection = steps.get("anomaly_detection", {})
+            anomaly_detected = anomaly_detection.get("has_anomaly", False)
+            
+            # SAM2 segmentasyon sonuçları
+            sam2_segmentation = steps.get("sam2_segmentation", {})
+            segmentation_performed = sam2_segmentation.get("success", False)
+            
+            # LLM analiz sonuçları
+            llm_analysis = steps.get("llm_analysis", {})
+            llm_analysis_completed = llm_analysis.get("success", False)
+            
+            # Final öneri
+            final_recommendation = "Bilinmiyor"
+            if llm_analysis_completed and llm_analysis.get("analysis", {}):
+                analysis = llm_analysis.get("analysis", {})
+                final_recommendation = analysis.get("recommended_action", 
+                                                  analysis.get("cozum_onerisi", "Öneri bulunamadı"))
+            elif anomaly_detected:
+                final_recommendation = "Manuel inceleme gerekli"
+            else:
+                final_recommendation = "Normal - Aksiyon gerekmez"
+            
+            # Summary objesi oluştur
+            summary = {
+                "anomaly_detected": anomaly_detected,
+                "segmentation_performed": segmentation_performed,
+                "llm_analysis_completed": llm_analysis_completed,
+                "final_recommendation": final_recommendation
+            }
+            
             report = {
                 "pipeline_info": {
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(results["timestamp"])),
@@ -773,6 +1131,7 @@ class IntegratedAnomalySystem:
                     "success": bool(results["success"])
                 },
                 "step_results": serializable_steps,
+                "summary": summary,
                 "error": str(results.get("error")) if results.get("error") else None,
                 "report_path": str(output_path)
             }
